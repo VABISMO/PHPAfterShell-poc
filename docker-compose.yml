@@ -18,7 +18,13 @@ services:
     # webshell (real targets: use an uploads directory instead). /tmp is a
     # bind mount of ./sessions - on a fresh clone Docker creates that host
     # directory root:755, so make it world-writable-sticky before serving.
-    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && exec apache2-foreground"
+    #
+    # Supervisor: the OOM may also select the apache master (pid 1 in the
+    # default image). A master death must cost ~0.5s of recovery, not
+    # Docker's escalating restart backoff (which reaches ~1min and starves
+    # the exploit of its attempt budget). pkill sweeps any orphaned
+    # children so the replacement master can rebind :80 immediately.
+    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && while true; do pkill -9 apache2 2>/dev/null; sleep 0.2; apache2-foreground || sleep 1; done"
     mem_limit: 64m
     restart: unless-stopped
     ports:
@@ -28,11 +34,13 @@ services:
       - ./sessions:/tmp
 
   # Fixed control: contains the CVE-2026-126714 fix (released 2026-11-19).
-  # Same memory boundary + writable webroot as the victim so the exploit's
-  # negative control exercises the real interruption path against it.
+  # Same memory boundary + writable webroot + supervisor as the victim so
+  # the exploit's negative control exercises the real interruption path
+  # against it (a fair control: the target must survive the pressure, the
+  # fixed parser must simply never produce the evil object).
   fixed:
     image: php:8.4.28-apache
-    command: sh -c "chmod 777 /var/www/html && exec apache2-foreground"
+    command: sh -c "chmod 777 /var/www/html && while true; do pkill -9 apache2 2>/dev/null; sleep 0.2; apache2-foreground || sleep 1; done"
     mem_limit: 64m
     restart: unless-stopped
     ports:

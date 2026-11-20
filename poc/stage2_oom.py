@@ -256,7 +256,7 @@ def r_len() -> int:
     return len(lab.r_prefix()) + lab.LEN2 + len(lab.r_suffix()) + lab.L1 + 17
 
 
-def main() -> int:
+def _main() -> int:
     global K_TARGET
     lab.set_geometry("small")   # local controller sets oom_score_adj itself
     K_TARGET = lab.k_target()
@@ -308,6 +308,27 @@ def main() -> int:
 
     print("\n=== STAGE2 RESULT: FAIL (no hit within attempts) ===")
     return 2
+
+
+def main() -> int:
+    """Entry point that always leaves the container as it was found."""
+    try:
+        return _main()
+    finally:
+        # Stage 2 tightens the memory boundary and raises oom_score_adj on
+        # the apache children; adj can never be lowered again without
+        # CAP_SYS_RESOURCE. Restore the compose default (64m) and restart so
+        # the next CI step (the remote exploit) gets a fresh, unpoisoned
+        # container instead of OOM-ing instantly on a stale limit.
+        # Cleanup must never mask the stage verdict: swallow errors here.
+        try:
+            lab.set_mem_limit(64 * 1024 * 1024)
+        except Exception as e:
+            print(f"[!] mem-limit restore failed: {e}")
+        try:
+            lab.restart_victim()
+        except Exception as e:
+            print(f"[!] victim restart failed: {e}")
 
 
 if __name__ == "__main__":
