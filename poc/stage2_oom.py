@@ -33,7 +33,8 @@ import lab
 
 X_EST = 40_000_000            # conservative estimate of victim transient charge
 CALIB_HEADROOM = 80_000_000   # first attempt: huge slack, sample the trace
-MAX_ATTEMPTS = 16
+MAX_ATTEMPTS = 32   # runner hardware is slower/noisier than a dev machine;
+                    # the damped feedback typically lands in <20 attempts
 K_TARGET = lab.k_target()     # refreshed by main() after set_geometry
 
 
