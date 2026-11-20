@@ -61,6 +61,7 @@ jobs:
             -F 'file=@/etc/hostname;filename=c.txt' \
             --limit-rate 1k http://127.0.0.1:8089/index.php >/dev/null &
           sleep 2
-          # no sess_* file must have appeared on the mitigated target
+          # session_start() always creates the session file; with the
+          # mitigation on, it must contain NO upload progress record
           docker exec phpaftershell-mitigated-1 sh -c \
-            "ls /tmp/sess_$SID 2>/dev/null && exit 1 || exit 0"
+            "! grep -q upload_progress_ /tmp/sess_$SID 2>/dev/null"

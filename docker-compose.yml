@@ -20,11 +20,13 @@ services:
     # directory root:755, so make it world-writable-sticky before serving.
     #
     # Supervisor: the OOM may also select the apache master (pid 1 in the
-    # default image). A master death must cost ~0.5s of recovery, not
+    # default image). A master death must cost ~1s of recovery, not
     # Docker's escalating restart backoff (which reaches ~1min and starves
-    # the exploit of its attempt budget). pkill sweeps any orphaned
-    # children so the replacement master can rebind :80 immediately.
-    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && while true; do pkill -9 apache2 2>/dev/null; sleep 0.2; apache2-foreground || sleep 1; done"
+    # the exploit of its attempt budget). The loop only starts apache when
+    # NOTHING is listening on :80 - orphaned prefork children keep the
+    # inherited listen socket and keep serving, so an in-flight attempt is
+    # never disturbed and the replacement master can always rebind.
+    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && while true; do if grep -q 0050.0A /proc/net/tcp /proc/net/tcp6 2>/dev/null; then sleep 1; else apache2-foreground || sleep 1; fi; done"
     mem_limit: 64m
     restart: unless-stopped
     ports:
@@ -40,7 +42,7 @@ services:
   # fixed parser must simply never produce the evil object).
   fixed:
     image: php:8.4.28-apache
-    command: sh -c "chmod 777 /var/www/html && while true; do pkill -9 apache2 2>/dev/null; sleep 0.2; apache2-foreground || sleep 1; done"
+    command: sh -c "chmod 777 /var/www/html && while true; do if grep -q 0050.0A /proc/net/tcp /proc/net/tcp6 2>/dev/null; then sleep 1; else apache2-foreground || sleep 1; fi; done"
     mem_limit: 64m
     restart: unless-stopped
     ports:
