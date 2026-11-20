@@ -45,6 +45,19 @@ jobs:
       - name: "Stage 2 - real interrupted pwrite via cgroup OOM"
         run: python poc/stage2_oom.py
 
+      - name: "Fresh target for the remote exploit"
+        # The local stages drive the lab hard (held connections, OOM
+        # interrupts, dirty session files). The HTTP-only chain starts
+        # from a clean target, exactly as a real engagement would.
+        run: |
+          docker compose -p phpaftershell up -d --force-recreate victim
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8087/ || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8087/
+
       - name: "Remote exploit - 100% HTTP RCE (webshell + command)"
         # the lab makes the webroot writable itself (compose command);
         # -u keeps the attempt feed live in the log even if the run is

