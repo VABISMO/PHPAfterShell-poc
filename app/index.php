@@ -39,6 +39,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && array_key_exists('bio', $_POST)) {
 header('Content-Type: application/json');
 $report = [
     'php'   => PHP_VERSION,
+    // Live cgroup baseline (phase-1 diagnostic): the exploit corrects its
+    // pressure by this every attempt, so the OOM lands in the same place
+    // regardless of the host's baseline drift (worker arena recycling
+    // moves it ~1-2MiB between attempts). Read before the session file
+    // below so it reflects the baseline, not the file cache.
+    'mem'   => (int) @file_get_contents('/sys/fs/cgroup/memory.current'),
     'keys'  => [],
     'types' => [],
     'objects' => [],
