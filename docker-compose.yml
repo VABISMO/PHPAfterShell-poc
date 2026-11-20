@@ -1,5 +1,11 @@
 # phpAfterShell (CVE-2026-126714) - Controlled local lab
 # All ports bound to 127.0.0.1 only. No external exposure.
+#
+# Fixed project name: container names (phpaftershell-victim-1, ...) must be
+# identical on every machine - GitHub Actions checks out into a
+# directory-named project, which would otherwise rename the containers.
+name: phpaftershell
+
 services:
   # Vulnerable default install: October-patched (PHP2Shell) but pre-phpAfterShell fix.
   victim:
@@ -8,6 +14,11 @@ services:
     # interruption needs a cgroup boundary. restart policy: the exploit's
     # remote pressure may occasionally select the apache master; the
     # container must come back by itself for the next attempt.
+    # The webroot must be writable so the injected gadget can drop the
+    # webshell (real targets: use an uploads directory instead). /tmp is a
+    # bind mount of ./sessions - on a fresh clone Docker creates that host
+    # directory root:755, so make it world-writable-sticky before serving.
+    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && exec apache2-foreground"
     mem_limit: 64m
     restart: unless-stopped
     ports:
@@ -17,14 +28,20 @@ services:
       - ./sessions:/tmp
 
   # Fixed control: contains the CVE-2026-126714 fix (released 2026-11-19).
+  # Same memory boundary + writable webroot as the victim so the exploit's
+  # negative control exercises the real interruption path against it.
   fixed:
     image: php:8.4.28-apache
+    command: sh -c "chmod 777 /var/www/html && exec apache2-foreground"
+    mem_limit: 64m
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8088:80"
     volumes:
-      - ./app:/var/www/html:ro
+      - ./app:/var/www/html
 
-  # Mitigation control: vulnerable version + official interim mitigation.
+  # Mitigation control: vulnerable version + official interim mitigation
+  # (session.upload_progress.enabled = 0): the entry path disappears.
   mitigated:
     image: php:8.4.27-apache
     ports:
