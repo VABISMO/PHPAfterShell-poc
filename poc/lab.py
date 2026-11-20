@@ -230,7 +230,10 @@ def sess_sync_evict(sid: str) -> None:
 
 def _http(host_port: int, req: bytes, read_resp: bool,
           timeout: float = 10.0) -> tuple[socket.socket, bytes]:
-    s = socket.create_connection((HOST, host_port))
+    # 30s socket timeout: a send (e.g. store_bio's 8 MiB body) must never
+    # block forever when the target's worker pool is degraded - a stalled
+    # attempt has to fail and retry, not hang the whole run.
+    s = socket.create_connection((HOST, host_port), timeout=30)
     s.sendall(req)
     if not read_resp:
         return s, b""

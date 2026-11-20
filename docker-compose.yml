@@ -19,14 +19,30 @@ services:
     # bind mount of ./sessions - on a fresh clone Docker creates that host
     # directory root:755, so make it world-writable-sticky before serving.
     #
-    # Supervisor: the OOM may also select the apache master (pid 1 in the
-    # default image). A master death must cost ~1s of recovery, not
-    # Docker's escalating restart backoff (which reaches ~1min and starves
-    # the exploit of its attempt budget). The loop only starts apache when
-    # NOTHING is listening on :80 - orphaned prefork children keep the
-    # inherited listen socket and keep serving, so an in-flight attempt is
-    # never disturbed and the replacement master can always rebind.
-    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && while true; do if grep -q 0050.0A /proc/net/tcp /proc/net/tcp6 2>/dev/null; then sleep 1; else apache2-foreground || sleep 1; fi; done"
+    # Supervisor: the OOM may also select the apache master. Recovery must
+    # be instant (not Docker's escalating restart backoff, which reaches
+    # ~1min and starves the exploit of its attempt budget). The master is
+    # tracked via its pidfile: while it is alive the loop sleeps inside
+    # apache2-foreground; once it is gone, orphaned children are swept
+    # (they cannot fork replacements and would pin :80 forever, forcing
+    # every new connection into a backlog no one drains) and a fresh
+    # master with a full worker pool takes over.
+    command:
+      - sh
+      - -c
+      - |
+        chmod 777 /var/www/html
+        chmod 1777 /tmp
+        while true; do
+          p=$$(cat /var/run/apache2/apache2.pid 2>/dev/null)
+          if [ -n "$$p" ] && kill -0 "$$p" 2>/dev/null; then
+            sleep 2
+          else
+            pkill -9 apache2 2>/dev/null
+            sleep 0.3
+            apache2-foreground || sleep 1
+          fi
+        done
     mem_limit: 64m
     restart: unless-stopped
     ports:
@@ -42,7 +58,21 @@ services:
   # fixed parser must simply never produce the evil object).
   fixed:
     image: php:8.4.28-apache
-    command: sh -c "chmod 777 /var/www/html && while true; do if grep -q 0050.0A /proc/net/tcp /proc/net/tcp6 2>/dev/null; then sleep 1; else apache2-foreground || sleep 1; fi; done"
+    command:
+      - sh
+      - -c
+      - |
+        chmod 777 /var/www/html
+        while true; do
+          p=$$(cat /var/run/apache2/apache2.pid 2>/dev/null)
+          if [ -n "$$p" ] && kill -0 "$$p" 2>/dev/null; then
+            sleep 2
+          else
+            pkill -9 apache2 2>/dev/null
+            sleep 0.3
+            apache2-foreground || sleep 1
+          fi
+        done
     mem_limit: 64m
     restart: unless-stopped
     ports:

