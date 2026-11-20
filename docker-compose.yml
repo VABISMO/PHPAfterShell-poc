@@ -1,0 +1,34 @@
+# phpAfterShell (CVE-2026-126714) - Controlled local lab
+# All ports bound to 127.0.0.1 only. No external exposure.
+services:
+  # Vulnerable default install: October-patched (PHP2Shell) but pre-phpAfterShell fix.
+  victim:
+    image: php:8.4.27-apache
+    # Bounded memory (as production containers normally are): the OOM-based
+    # interruption needs a cgroup boundary. restart policy: the exploit's
+    # remote pressure may occasionally select the apache master; the
+    # container must come back by itself for the next attempt.
+    mem_limit: 64m
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8087:80"
+    volumes:
+      - ./app:/var/www/html
+      - ./sessions:/tmp
+
+  # Fixed control: contains the CVE-2026-126714 fix (released 2026-11-19).
+  fixed:
+    image: php:8.4.28-apache
+    ports:
+      - "127.0.0.1:8088:80"
+    volumes:
+      - ./app:/var/www/html:ro
+
+  # Mitigation control: vulnerable version + official interim mitigation.
+  mitigated:
+    image: php:8.4.27-apache
+    ports:
+      - "127.0.0.1:8089:80"
+    volumes:
+      - ./app:/var/www/html:ro
+      - ./config/mitigation.ini:/usr/local/etc/php/conf.d/99-mitigation.ini:ro

