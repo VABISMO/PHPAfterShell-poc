@@ -9,7 +9,11 @@ name: phpaftershell
 services:
   # Vulnerable default install: October-patched (PHP2Shell) but pre-phpAfterShell fix.
   victim:
-    image: php:8.4.27-apache
+    build:
+      context: .
+      args:
+        PHP_VERSION: "8.4.27"
+    image: phpaftershell-victim:latest
     # Bounded memory (as production containers normally are): the OOM-based
     # interruption needs a cgroup boundary. restart policy: the exploit's
     # remote pressure may occasionally select the apache master; the
@@ -58,7 +62,11 @@ services:
   # against it (a fair control: the target must survive the pressure, the
   # fixed parser must simply never produce the evil object).
   fixed:
-    image: php:8.4.28-apache
+    build:
+      context: .
+      args:
+        PHP_VERSION: "8.4.28"
+    image: phpaftershell-fixed:latest
     command:
       - sh
       - -c

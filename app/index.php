@@ -27,6 +27,29 @@ if (isset($_GET['gc'])) {
     exit;
 }
 
+// Eviction helper for the exploit's controller (phase-1 lab endpoint,
+// like gc: real targets do not have it and the exploit treats its absence
+// as a no-op). Runs sessdrop(1) - which evicts the record's clean page
+// cache in a loop - while the victim request rewrites it, so the pwrite
+// re-creates - re-charges - those pages and the cgroup crosses its limit
+// *inside* the splice window. Same eviction the local stage-2 controller
+// performs with fadvise(2), reached over HTTP.
+if (isset($_GET['drop'])) {
+    header('Content-Type: application/json');
+    $sid = preg_replace('/[^a-f0-9]/', '', (string) $_GET['drop']);
+    $ms  = min(8000, max(100, (int) ($_GET['ms'] ?? 4000)));
+    $path = (session_save_path() ?: sys_get_temp_dir()) . '/sess_' . $sid;
+    $ok = false;
+    if ($sid !== '' && is_executable('/usr/local/bin/sessdrop')) {
+        // blocks for $ms while the helper evicts in a loop
+        @shell_exec('/usr/local/bin/sessdrop ' . escapeshellarg($path)
+                    . ' ' . $ms);
+        $ok = true;
+    }
+    echo json_encode(['drop' => $ok ? 1 : 0, 'ok' => $ok]);
+    exit;
+}
+
 session_start();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && array_key_exists('bio', $_POST)) {

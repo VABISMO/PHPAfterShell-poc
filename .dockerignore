@@ -1,0 +1,4 @@
+# The image only needs sessdrop.c - keep the build context to that
+# (the sessions/ bind mount alone can be hundreds of MiB).
+*
+!sessdrop.c
