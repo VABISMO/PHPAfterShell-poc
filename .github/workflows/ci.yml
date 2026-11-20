@@ -58,6 +58,12 @@ jobs:
           done
           curl -sf http://127.0.0.1:8087/
 
+      - name: "Charge trace (diagnostic - victim charge curve on this host)"
+        # lab-side harness (like the stages, may docker exec): prints the
+        # cgroup charge curve of a real attempt so the log shows exactly
+        # where this host crosses the limit
+        run: python3 -u poc/charge_trace.py 8087
+
       - name: "Remote exploit - 100% HTTP RCE (webshell + command)"
         # the lab makes the webroot writable itself (compose command);
         # -u keeps the attempt feed live in the log even if the run is

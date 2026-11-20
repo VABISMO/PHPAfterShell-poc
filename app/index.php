@@ -34,8 +34,36 @@ if (isset($_GET['gc'])) {
 // re-creates - re-charges - those pages and the cgroup crosses its limit
 // *inside* the splice window. Same eviction the local stage-2 controller
 // performs with fadvise(2), reached over HTTP.
+// Baseline probe for the exploit's controller (phase-1 lab endpoint,
+// like gc/drop: real targets do not have it and the exploit treats its
+// absence as a no-op). Reports the live cgroup charge while THIS request
+// runs - i.e. after the fillers are loaded and before the victim starts,
+// the only moment the pressure-relevant baseline can be read. The reply
+// includes the request's own RSS so the caller can subtract costs that
+// are not part of the baseline.
+if (isset($_GET['probe'])) {
+    header('Content-Type: application/json');
+    $self = 0;
+    $st = @file_get_contents('/proc/self/statm');
+    if ($st !== false) {
+        $parts = preg_split('/\s+/', trim($st));
+        if (count($parts) >= 2) {
+            $self = (int) $parts[1] * 4096;   // resident pages
+        }
+    }
+    echo json_encode([
+        'mem'  => (int) @file_get_contents('/sys/fs/cgroup/memory.current'),
+        'self' => $self,
+    ]);
+    exit;
+}
+
 if (isset($_GET['drop'])) {
     header('Content-Type: application/json');
+    // Measure the cgroup here, with this process already live: this is
+    // the state the victim request is about to enter, drop worker
+    // included. The exploit anchors its pressure correction on this.
+    $mem = (int) @file_get_contents('/sys/fs/cgroup/memory.current');
     $sid = preg_replace('/[^a-f0-9]/', '', (string) $_GET['drop']);
     $ms  = min(8000, max(100, (int) ($_GET['ms'] ?? 4000)));
     $path = (session_save_path() ?: sys_get_temp_dir()) . '/sess_' . $sid;
@@ -46,7 +74,7 @@ if (isset($_GET['drop'])) {
                     . ' ' . $ms);
         $ok = true;
     }
-    echo json_encode(['drop' => $ok ? 1 : 0, 'ok' => $ok]);
+    echo json_encode(['drop' => $ok ? 1 : 0, 'ok' => $ok, 'mem' => $mem]);
     exit;
 }
 

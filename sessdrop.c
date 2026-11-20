@@ -19,11 +19,19 @@
 
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
-    int fd = open(argv[1], O_RDONLY);
+    int fd = open(argv[1], O_RDWR);
     if (fd < 0) return 1;
     int ms = argc > 2 ? atoi(argv[2]) : 4000;
     if (ms < 100) ms = 100;
     if (ms > 8000) ms = 8000;
+
+    /* DONTNEED cannot drop dirty pages, and the record was just written
+     * (writeback runs every ~5s). Flush it first so the eviction below
+     * actually releases the charge; from here on only clean pages are
+     * dropped - including the ones the victim's own read re-creates
+     * during serialization, which is what the pwrite then has to pay for
+     * again, inside the splice window. */
+    fsync(fd);
 
     struct timespec t, req = {0, 2000 * 1000}; /* 2ms between drops */
     clock_gettime(CLOCK_MONOTONIC, &t);
