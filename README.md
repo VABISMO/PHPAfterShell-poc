@@ -173,6 +173,24 @@ samples the band (the landing is stochastic at the edges). On the
 bundled lab it lands within a handful of attempts; `--attempts`
 (default 40) raises the budget.
 
+## WordPress target (research status)
+
+The exploit ships `--chain wordpress`, which plants **WordPress's own
+core gadget** instead of the lab's FileCache: PHPGGC `WordPress/RCE2` —
+`WP_HTML_Token::__destruct()` → `system()` (verified by round-tripping
+the exact planted bytes through PHP: `unserialize` → `unset` → command
+output). No lab-provided gadget is involved.
+
+The full chain against a real WordPress is **built but parked**: every
+mechanical piece is proven (session entry via a realistic mu-plugin,
+carrier record, +29 MiB of filler pressure, the 16 MiB victim rewrite,
+the gadget), but the **OOM crossing does not converge yet** — WP's
+~20–30 MiB of *evictable* code page-cache absorbs the charge before the
+cgroup limit is reached, so the victim's write is never interrupted in
+the window. Measured configurations, the numbers, and the lead for
+resuming (a `mem_limit ≈ 110–118m` window) are documented in
+[`experiments/wordpress/README.md`](experiments/wordpress/README.md).
+
 ## Controls (the lab proves the fix works)
 
 CI runs both controls on every push:

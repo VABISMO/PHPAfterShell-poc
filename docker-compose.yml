@@ -132,3 +132,4 @@ services:
     volumes:
       - ./app:/var/www/html
       - ./sessions:/tmp
+

