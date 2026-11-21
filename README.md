@@ -1,6 +1,7 @@
 # PHPAfterShell-poc
 
 [![CI](https://github.com/VABISMO/PHPAfterShell-poc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/VABISMO/PHPAfterShell-poc)](https://github.com/VABISMO/PHPAfterShell-poc/releases)
 [![CVE](https://img.shields.io/badge/CVE--2026--126714-critical-red)](https://www.cve.org/CVERecord?id=CVE-2026-126714)
 [![PHP](https://img.shields.io/badge/PHP-8.2%20%E2%80%93%208.5%20(affected)-orange)](https://www.php.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -186,9 +187,40 @@ session.upload_progress.enabled = 0
 …closes the upload-progress entry path but **does not repair the session
 handler**; upgrading to 8.2.36 / 8.3.37 / 8.4.28 / 8.5.13 is the fix.
 
+## Detection & IOCs (for defenders)
+
+Even without the fixed release, the chain leaves traces:
+
+- **Session files** — `sess_*` files growing to multiple MiB, or log
+  lines with `Failed to decode` (a session file that no longer parses is
+  the direct product of an interrupted write).
+- **Webshell drops** — new `.php` files under the webroot containing a
+  one-liner like `<?php system($_GET['c']);`. This PoC writes a random
+  `s_<hex>.php` name per run — treat *any* unexpected webroot `.php` as
+  an IOC, and watch for writes during multipart uploads.
+- **Progress records** — an `upload_progress_*` session key whose
+  `field_name` is a multi-megabyte run of a single character (the
+  replacement filename used to open the splice window).
+- **Resource behaviour** — apache/php workers dying mid-request during
+  unauthenticated multipart uploads that hold their connections open,
+  or cgroup OOM kills clustered around such traffic.
+- **Process behaviour** — held connections that never send their body,
+  followed by a rewrite of the same session id from a second connection.
+
+Cheap mitigations when you cannot upgrade yet: keep
+`session.upload_progress.enabled = 0` (the interim mitigation above),
+monitor the webroot for unexpected file creation (file-integrity
+monitoring), and alert on multi-megabyte session files.
+
 ## Development
 
 ```bash
+make up        # start the lab, block until every healthcheck passes
+make test      # offline unit tests (geometry, decoder, classifier)
+make e2e       # full local mirror of the CI sequence
+make clean     # wipe lab artifacts (sessions, results, stray shells)
+
+# or directly:
 python -m pip install pytest
 python -m pytest tests/ -q     # offline: geometry, decoder, classifier
 

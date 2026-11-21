@@ -28,16 +28,8 @@ jobs:
       - name: Start the lab (vulnerable / fixed / mitigated targets)
         # -p pins the project name so container names are deterministic
         # (phpaftershell-victim-1, ...) regardless of checkout directory.
-        run: docker compose -p phpaftershell up -d
-      - name: Wait for the targets
-        run: |
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:8087/ >/dev/null && break
-            sleep 2
-          done
-          curl -sf http://127.0.0.1:8087/
-          curl -sf http://127.0.0.1:8088/
-          curl -sf http://127.0.0.1:8089/
+        # --wait blocks until every healthcheck passes.
+        run: docker compose -p phpaftershell up -d --wait
 
       - name: "Stage 1 - deterministic spliced-session object injection"
         run: python poc/stage1_splice.py
@@ -50,12 +42,7 @@ jobs:
         # interrupts, dirty session files). The HTTP-only chain starts
         # from a clean target, exactly as a real engagement would.
         run: |
-          docker compose -p phpaftershell up -d --force-recreate victim
-          for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8087/ || true)
-            [ "$code" = "200" ] && break
-            sleep 2
-          done
+          docker compose -p phpaftershell up -d --force-recreate --wait victim
           curl -sf http://127.0.0.1:8087/
 
       - name: "Charge trace (diagnostic - victim charge curve on this host)"

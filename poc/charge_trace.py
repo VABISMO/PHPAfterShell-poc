@@ -26,6 +26,7 @@ DURATION_S = SAMPLES * 0.02
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8087
     lab.set_geometry("big")
+    lab.set_shell(lab.new_shell_name())   # never inherit a stale shell
     lab.HOST, lab.PORT = "127.0.0.1", port
     h = 22_000_000
     c_len = remote.P_START + lab.L1 + 2

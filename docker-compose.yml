@@ -45,6 +45,14 @@ services:
         done
     mem_limit: 64m
     restart: unless-stopped
+    # gadget.php answers 200 without starting a session - the health
+    # probe must not create a sess_* file every interval
+    healthcheck:
+      test: ["CMD-SHELL", php -r 'exit(@file_get_contents("http://127.0.0.1/gadget.php")===false?1:0);']
+      interval: 2s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
     ports:
       - "127.0.0.1:8087:80"
     volumes:
@@ -76,6 +84,12 @@ services:
         done
     mem_limit: 64m
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", php -r 'exit(@file_get_contents("http://127.0.0.1/gadget.php")===false?1:0);']
+      interval: 2s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
     ports:
       - "127.0.0.1:8088:80"
     volumes:
@@ -86,6 +100,12 @@ services:
   # (session.upload_progress.enabled = 0): the entry path disappears.
   mitigated:
     image: php:8.4.27-apache
+    healthcheck:
+      test: ["CMD-SHELL", php -r 'exit(@file_get_contents("http://127.0.0.1/gadget.php")===false?1:0);']
+      interval: 2s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
     ports:
       - "127.0.0.1:8089:80"
     volumes:
