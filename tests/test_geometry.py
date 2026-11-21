@@ -169,7 +169,7 @@ def test_payload_plant():
     rel = e_off - p_start
     assert payload[rel:rel + len(lab.SUFFIX)] == lab.SUFFIX
     obj_at = rel + len(lab.SUFFIX)
-    assert payload[obj_at:obj_at + len(lab.OBJ)] == lab.OBJ
+    assert payload[obj_at:obj_at + len(lab.obj_bytes())] == lab.obj_bytes()
     c = SYNTH_PROGRESS + f'bio|s:{lab.L1}:"'.encode() + payload + b'";'
     lab.verify_c(c, p_start, e_off, payload)
 
@@ -187,7 +187,8 @@ def test_splice_decodes_to_filecache():
         sess = php_session_decode(mix)
         assert "evil" in sess, f"no evil key for k={k}"
         assert sess["evil"]["__class__"] == "FileCache"
-        assert sess["evil"]["path"] == b"/var/www/html/s.php"
+        assert sess["evil"]["path"] == ("/var/www/html"
+                                        + lab.shell_path()).encode()
         assert b"system" in sess["evil"]["content"]
         assert "pad" in sess
 
@@ -228,22 +229,48 @@ def test_bp_digit_stability():
     assert lab.f_offset() == len(a)
 
 
-def test_classify():
+def test_classify_file():
+    """The no-oracle controller classifies state off the file itself."""
     c, _ = make_c()
     r = make_r(c)
-    cl, rl = len(c), len(r)
-    hit = {"objects": {"evil": {"class": "FileCache", "props": {}}}}
-    assert remote.classify(hit, cl, rl)[0] == "hit"
-    dead = {"dead": True}
-    assert remote.classify(dead, cl, rl)[0] == "oracle-failed"
-    full = {"size": rl, "gstart": lab.f_offset(), "glen": lab.LEN2}
-    assert remote.classify(full, cl, rl)[0] == "nooom"
-    untouched = {"size": cl, "keys": [], "flen": 4}
-    assert remote.classify(untouched, cl, rl)[0] == "early"
-    partial = {"size": cl, "gstart": lab.f_offset(), "glen": 1234,
-               "keys": ["upload_progress_x", "bio"], "flen": lab.LF}
-    out, k = remote.classify(partial, cl, rl)
-    assert out == "mix" and k == lab.f_offset() + 1234
+
+    # nothing written yet: OOM before the pwrite
+    assert lab.classify_file(b"", c) == ("empty", None)
+    assert lab.classify_file(c, c) == ("early", 0)
+
+    # deterministic splice inside the window: exact k comes back
+    k = lab.pick_k(lab.f_offset(), lab.e_offset())
+    mix = lab.splice(c, r, k)
+    out, kk = lab.classify_file(mix, c)
+    assert out == "mix" and kk == k
+
+    # write completed / ran past the window: late at E', never a hit
+    assert lab.classify_file(r, c)[0] == "late"
+    k2 = lab.e_offset() + 4096
+    if k2 < len(c):
+        past = lab.splice(c, r, k2)
+        assert lab.classify_file(past, c)[0] == "late"
+
+
+def test_derive_signals():
+    """Natural signals map to pressure directions (no target report)."""
+    # a decode warning is untrustworthy: hold
+    assert remote._derive({"decode_failed": True, "victim": "eof"},
+                          [])[0] == "noise"
+    # the write completed: the limit was never crossed -> more pressure
+    assert remote._derive({"victim": "timeout", "drop_ms": 6006.0},
+                          [])[0] == "nooom"
+    # death times calibrate the early/late split from this run itself
+    times = [120.0, 900.0]           # split = 120 + (900-120)/3 = 380
+    fast = {"victim": "eof", "drop_ms": 200.0}
+    slow = {"victim": "rst", "drop_ms": 750.0}
+    assert remote._derive(fast, times)[0] == "early"   # died before the write
+    assert remote._derive(slow, times)[0] == "late"    # died deeper in it
+    # no calibration yet: bootstrap threshold
+    assert remote._derive({"victim": "eof", "drop_ms": 50.0},
+                          [])[0] == "early"
+    assert remote._derive({"victim": "eof", "drop_ms": 900.0},
+                          [])[0] == "late"
 
 
 def test_remote_payload_big_geometry():

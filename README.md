@@ -1,6 +1,6 @@
 # PHPAfterShell-poc
 
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue)](.github/workflows/ci.yml)
+[![CI](https://github.com/VABISMO/PHPAfterShell-poc/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [![CVE](https://img.shields.io/badge/CVE--2026--126714-critical-red)](https://www.cve.org/CVERecord?id=CVE-2026-126714)
 [![PHP](https://img.shields.io/badge/PHP-8.2%20%E2%80%93%208.5%20(affected)-orange)](https://www.php.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -8,8 +8,9 @@
 **Educational proof of concept for CVE-2026-126714 ("phpAfterShell")** — an
 unauthenticated remote code execution chain against PHP's default file-based
 session handler. Ships a fully automated local lab, an HTTP-only exploit
-launcher, and three verification stages that go from the raw parser effect
-up to command execution.
+launcher that needs **no cooperation from the target** (no diagnostic
+endpoints, no state dumps — natural signals only), and three verification
+stages that go from the raw parser effect up to command execution.
 
 > **Authorized testing only.** Run it against the bundled lab (localhost) or
 > systems you own/have permission to test. See [Disclaimer](#disclaimer).
@@ -61,24 +62,28 @@ access to the target.
 ```
 ├── phpaftershell-poc        # the exploit launcher (banner + CLI)
 ├── docker-compose.yml       # vulnerable / fixed / mitigated targets
-├── app/                     # demo target app (consumer + FileCache gadget)
+├── app/                     # deliberately boring target app + gadget
+│                            # (no diagnostic endpoints at all)
 ├── poc/
 │   ├── lab.py               # byte-level geometry engine + HTTP helpers
 │   ├── remote.py            # 100% HTTP-only exploit chain (used by the CLI)
 │   ├── stage1_splice.py     # deterministic interrupted-write simulation
-│   └── stage2_oom.py        # real interrupted pwrite via cgroup OOM
+│   ├── stage2_oom.py        # real interrupted pwrite via cgroup OOM
+│   └── charge_trace.py      # diagnostic: this host's victim charge curve
 ├── tests/test_geometry.py   # offline unit tests (no docker needed)
-└── .github/workflows/ci.yml # lint + unit + end-to-end RCE
+└── .github/workflows/ci.yml # unit + end-to-end RCE + controls
 ```
 
 ## Quick start
 
+Requires Docker with Compose v2.
+
 ```bash
 # 1. start the lab: vulnerable (8087), fixed (8088), mitigated (8089)
+#    (the lab makes the webroot writable itself)
 docker compose up -d
 
 # 2. fire the exploit (100% HTTP, no docker access needed on the target)
-chmod 777 app                       # the gadget needs a writable webroot
 ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id; uname -srm'
 ```
 
@@ -96,11 +101,11 @@ Linux ... x86_64
 |---|---|---|
 | `python poc/stage1_splice.py` | The splice grammar: `R[:k] \|\| C[k:]` decodes into a live `FileCache` object | simulated (writes the mixed state directly) |
 | `python poc/stage2_oom.py` | The **real** interrupted `pwrite()` — memcg OOM kills the worker inside the syscall | real (local controller sets `oom_score_adj`) |
-| `./phpaftershell-poc --target …` | Full chain over **plain HTTP only**: pressure → interrupted write → object injection → webshell → command | real (remote memory pressure) |
+| `./phpaftershell-poc --target …` | Full chain over **plain HTTP only**: pressure → interrupted write → object injection → webshell → command — tuned from natural signals alone, the target reports nothing | real (remote memory pressure) |
 
 ## How the splice works
 
-The exploit exploits the fact that the session serializer is a stream of
+The chain leans on the fact that the session serializer is a stream of
 `key|value` records with attacker-controlled length fields, and that `C` and
 `R` differ only in the position of the `bio` record (the progress record in
 `R` is ~8 MiB longer):
@@ -121,8 +126,9 @@ parse mix:  ... R's filename string closes at E' using C's planted '"' ...
 
 The accepted window for `k` is `[f, E')` — about **8 MiB wide** in the
 remote geometry — which is what makes the OOM timing tractable: the
-controller only has to land the cgroup charge failure somewhere inside it
-and then reads the exact `k` back from the target's oracle to tune itself.
+exploit only has to land the cgroup charge failure somewhere inside it,
+and it only ever watches **natural signals** to know where it landed
+(see below) — the target reports nothing.
 
 ## Requirements & reliability notes
 
@@ -136,18 +142,39 @@ The exploit (all three stages) needs:
 - **low latency** to the target (the bundled lab is localhost; timing is
   feedback-tuned but a WAN round trip widens the jitter).
 
-The remote mode measures the exact splice offset through the demo app's
-diagnostic oracle and adjusts its pressure each attempt (damped feedback).
-On the bundled lab it lands within a handful of attempts; `--attempts`
+The remote mode gets **no help from the target**: the demo app exposes no
+diagnostic endpoint, no state dump and no helper route. Every attempt is
+judged from natural signals alone —
+
+- **the victim connection itself**: a timeout means the write completed
+  (limit never crossed → more pressure), a fast death means the OOM
+  struck before the write (→ less pressure), a slow death means it
+  struck deeper into the rewrite (→ more pressure); the fast/slow split
+  calibrates from the run's own death times, so it encodes no host's
+  timing;
+- **PHP's `Failed to decode` warning** on the consumer response: the file
+  is structurally broken → the attempt carries no trustworthy direction
+  and the pressure is held;
+- **the webshell probe**: the shell name is randomised **per run**, so a
+  stale shell can never fake a hit — this is the only positive signal.
+
+The pressure search bisects those signals into a bracket, slides a
+collapsed bracket toward the last signal instead of freezing, and then
+samples the band (the landing is stochastic at the edges). On the
+bundled lab it lands within a handful of attempts; `--attempts`
 (default 40) raises the budget.
 
 ## Controls (the lab proves the fix works)
 
+CI runs both controls on every push:
+
 ```bash
-# patched target (8.4.28): the interruption can no longer produce a mix
-python poc/stage1_splice.py # against :8087  -> HIT
-# mitigated target: session.upload_progress.enabled = 0  -> no progress
-# record is ever written, so the whole entry path disappears (see CI)
+# patched target (8.4.28): same real interruption path, must exhaust its
+# attempt budget WITHOUT a hit - the fixed parser cannot produce a mix
+! ./phpaftershell-poc --target http://127.0.0.1:8088 --command 'id' --attempts 8
+
+# mitigated target: session.upload_progress.enabled = 0 -> no progress
+# record is ever written, so the whole entry path disappears
 ```
 
 Interim mitigation (if you cannot upgrade yet) — from PHP / depthfirst:
@@ -164,11 +191,15 @@ handler**; upgrading to 8.2.36 / 8.3.37 / 8.4.28 / 8.5.13 is the fix.
 ```bash
 python -m pip install pytest
 python -m pytest tests/ -q     # offline: geometry, decoder, classifier
+
+python poc/charge_trace.py 8087  # prints this host's victim charge curve
 ```
 
 CI (`.github/workflows/ci.yml`) runs the unit tests plus the full
-end-to-end chain: stage 1, stage 2, and the remote exploit against the
-bundled lab, plus the mitigated-target control.
+end-to-end chain on every push: stage 1, stage 2, a fresh target for the
+remote exploit, the charge-trace diagnostic, the remote RCE itself, and
+both controls (patched 8.4.28 must not be exploitable; the mitigated
+target must never write a progress record).
 
 ## References
 

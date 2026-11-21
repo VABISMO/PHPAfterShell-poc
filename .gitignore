@@ -8,7 +8,7 @@ venv/
 # Lab artifacts
 sessions/
 results/
-app/s.php
+app/s*.php
 *.log
 
 # Editors / OS

