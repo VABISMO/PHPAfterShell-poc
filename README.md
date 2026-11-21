@@ -62,9 +62,10 @@ access to the target.
 
 ```
 ├── phpaftershell-poc        # the exploit launcher (banner + CLI)
-├── docker-compose.yml       # vulnerable / fixed / mitigated targets
+├── docker-compose.yml       # vulnerable / fixed / mitigated / fpm targets
 ├── app/                     # deliberately boring target app + gadget
 │                            # (no diagnostic endpoints at all)
+├── fpm/                     # nginx + php-fpm target (cross-SAPI proof)
 ├── poc/
 │   ├── lab.py               # byte-level geometry engine + HTTP helpers
 │   ├── remote.py            # 100% HTTP-only exploit chain (used by the CLI)
@@ -80,9 +81,10 @@ access to the target.
 Requires Docker with Compose v2.
 
 ```bash
-# 1. start the lab: vulnerable (8087), fixed (8088), mitigated (8089)
+# 1. start the lab: vulnerable (8087), fixed (8088), mitigated (8089),
+#    nginx + php-fpm cross-SAPI target (8090)
 #    (the lab makes the webroot writable itself)
-docker compose up -d
+docker compose up -d --wait
 
 # 2. fire the exploit (100% HTTP, no docker access needed on the target)
 ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id; uname -srm'
@@ -142,6 +144,12 @@ The exploit (all three stages) needs:
   real frameworks/apps (WordPress, Laravel, …) have known gadget chains;
 - **low latency** to the target (the bundled lab is localhost; timing is
   feedback-tuned but a WAN round trip widens the jitter).
+
+The chain is **SAPI-agnostic** — CI proves it against both bundled
+targets: Apache/mod_php (8087) and nginx + php-fpm (8090, the most
+common production pairing; built in `fpm/` with
+`fastcgi_request_buffering off` so the held filler bodies buffer in the
+FPM worker exactly like mod_php buffers them).
 
 The remote mode gets **no help from the target**: the demo app exposes no
 diagnostic endpoint, no state dump and no helper route. Every attempt is
@@ -229,9 +237,10 @@ python poc/charge_trace.py 8087  # prints this host's victim charge curve
 
 CI (`.github/workflows/ci.yml`) runs the unit tests plus the full
 end-to-end chain on every push: stage 1, stage 2, a fresh target for the
-remote exploit, the charge-trace diagnostic, the remote RCE itself, and
-both controls (patched 8.4.28 must not be exploitable; the mitigated
-target must never write a progress record).
+remote exploit, the charge-trace diagnostic, the remote RCE itself, the
+**same chain again against nginx + php-fpm (cross-SAPI)**, and both
+controls (patched 8.4.28 must not be exploitable; the mitigated target
+must never write a progress record).
 
 ## References
 

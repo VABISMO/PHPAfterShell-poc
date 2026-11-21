@@ -57,6 +57,11 @@ jobs:
         # cancelled mid-flight
         run: python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 40
 
+      - name: "Cross-SAPI - the same chain against nginx + php-fpm"
+        # proves the exploit is SAPI-agnostic: different front-end,
+        # different worker model, same vulnerable PHP
+        run: python3 -u ./phpaftershell-poc --target http://127.0.0.1:8090 --command 'id' --attempts 40
+
       - name: "Control - patched PHP (8.4.28) must not be exploitable"
         # same real interruption path, must exhaust attempts without a hit
         run: "! python3 -u ./phpaftershell-poc --target http://127.0.0.1:8088 --command 'id' --attempts 8"

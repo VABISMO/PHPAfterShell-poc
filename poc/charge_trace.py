@@ -8,7 +8,7 @@ HTTP-only exploit), then prints the series so the exact charge curve of
 the victim's read / serialization / pwrite - and where the cgroup limit
 is actually crossed - can be read straight off the CI log.
 
-usage: charge_trace.py [port]
+usage: charge_trace.py [port] [container]
 """
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ DURATION_S = SAMPLES * 0.02
 
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8087
+    if len(sys.argv) > 2:
+        lab.CONTAINER = sys.argv[2]   # e.g. phpaftershell-fpm-1
     lab.set_geometry("big")
     lab.set_shell(lab.new_shell_name())   # never inherit a stale shell
     lab.HOST, lab.PORT = "127.0.0.1", port

@@ -111,3 +111,24 @@ services:
     volumes:
       - ./app:/var/www/html:ro
       - ./config/mitigation.ini:/usr/local/etc/php/conf.d/99-mitigation.ini:ro
+
+  # Cross-SAPI target: nginx + php-fpm - the most common production
+  # pairing. Same vulnerable PHP, same app, same memcg boundary; built
+  # from fpm/ (see fastcgi_request_buffering off there). The exploit is
+  # SAPI-agnostic: CI proves the chain against this target too.
+  fpm:
+    build: ./fpm
+    command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf"
+    mem_limit: 64m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", php -r 'exit(@file_get_contents("http://127.0.0.1/gadget.php")===false?1:0);']
+      interval: 2s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+    ports:
+      - "127.0.0.1:8090:80"
+    volumes:
+      - ./app:/var/www/html
+      - ./sessions:/tmp

