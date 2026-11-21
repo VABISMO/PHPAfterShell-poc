@@ -136,3 +136,78 @@ services:
       - ./app:/var/www/html
       - ./sessions:/tmp
 
+  # Laravel target: stock Laravel 11 on vulnerable PHP 8.4.27, app
+  # baked at build time (no DB, no install-on-boot). The entry point
+  # is a route middleware using native PHP sessions (a very common
+  # package pattern); no diagnostics, no endpoints.
+  laravel:
+    # OPT-IN while WIP (serve-from-public/ + cookie middleware + gadget
+    # still unverified): docker compose --profile laravel up -d --wait
+    profiles: ["laravel"]
+    build: ./laravel
+    command: ["/usr/local/bin/lab-setup.sh"]
+    mem_limit: 64m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/www/html/.lab-installed && php -r 'exit(@fsockopen(\"127.0.0.1\", 80)?0:1);'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    ports:
+      - "127.0.0.1:8092:80"
+
+  # WordPress target - OPT-IN via profile (never started by CI or a
+  # plain 'docker compose up'):
+  #   docker compose --profile wp up -d --wait
+  # The chain against it is fully built (gadget from WordPress's own
+  # core, entry via a realistic session-using mu-plugin) but the OOM
+  # landing has not been reliable yet - see
+  # experiments/wordpress/README.md for the measurements. Keeping it
+  # behind a profile keeps the default lab and CI green while the
+  # target stays runnable for research.
+  wp:
+    profiles: ["wp"]
+    build: ./experiments/wordpress
+    command: ["/usr/local/bin/lab-setup.sh"]
+    depends_on:
+      wp-db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: wp-db
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_DB_NAME: wordpress
+      WP_URL: http://127.0.0.1:8091
+    mem_limit: 96m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/www/html/.lab-installed && php -r 'exit(@fsockopen(\"127.0.0.1\", 80)?0:1);'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    ports:
+      - "127.0.0.1:8091:80"
+    volumes:
+      - wp-data:/var/www/html
+      - ./experiments/wordpress/wp-apache-tuning.conf:/etc/apache2/conf-enabled/zz-lab.conf:ro
+      - ./experiments/wordpress/wp-sessions.ini:/usr/local/etc/php/conf.d/zz-lab-sessions.ini:ro
+
+  wp-db:
+    profiles: ["wp"]
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  wp-data:

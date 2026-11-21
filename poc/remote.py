@@ -266,7 +266,7 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     time.sleep(0.4)                 # let the charge settle before the victim
 
     victim, _ = lab.replacement_hold(sid)
-    ev, drop_ms, vresp = victim_wait(victim, timeout=6.0)
+    ev, drop_ms, vresp = victim_wait(victim, timeout=3.0)
     res["victim"] = ev
     res["drop_ms"] = round(drop_ms, 1)
     if vresp:
