@@ -11,7 +11,9 @@ unauthenticated remote code execution chain against PHP's default file-based
 session handler. Ships a fully automated local lab, an HTTP-only exploit
 launcher that needs **no cooperation from the target** (no diagnostic
 endpoints, no state dumps — natural signals only), and three verification
-stages that go from the raw parser effect up to command execution.
+stages that go from the raw parser effect up to command execution. CI
+re-proves the chain on **Apache/mod_php and nginx + php-fpm** on every
+push, with negative controls.
 
 > **Authorized testing only.** Run it against the bundled lab (localhost) or
 > systems you own/have permission to test. See [Disclaimer](#disclaimer).
@@ -63,8 +65,11 @@ access to the target.
 ```
 ├── phpaftershell-poc        # the exploit launcher (banner + CLI)
 ├── docker-compose.yml       # vulnerable / fixed / mitigated / fpm targets
+├── Makefile                 # make up | test | e2e | clean
+├── SECURITY.md              # reporting policy, scope, lab hardening
 ├── app/                     # deliberately boring target app + gadget
 │                            # (no diagnostic endpoints at all)
+├── config/                  # lab tuning: apache pool, mitigations
 ├── fpm/                     # nginx + php-fpm target (cross-SAPI proof)
 ├── poc/
 │   ├── lab.py               # byte-level geometry engine + HTTP helpers
@@ -72,7 +77,9 @@ access to the target.
 │   ├── stage1_splice.py     # deterministic interrupted-write simulation
 │   ├── stage2_oom.py        # real interrupted pwrite via cgroup OOM
 │   └── charge_trace.py      # diagnostic: this host's victim charge curve
+├── scripts/e2e-local.sh     # local mirror of the CI sequence (make e2e)
 ├── tests/test_geometry.py   # offline unit tests (no docker needed)
+├── experiments/wordpress/   # parked WordPress target + research notes
 └── .github/workflows/ci.yml # unit + end-to-end RCE + controls
 ```
 
@@ -98,6 +105,16 @@ uid=33(www-data) gid=33(www-data) groups=33(www-data)
 Linux ... x86_64
 ```
 
+CLI options:
+
+```bash
+--target URL        # base URL of the target (required)
+--command CMD       # shell command to execute (required)
+--attempts N        # interruption budget (default 40; CI uses 80)
+--chain NAME        # planted gadget: filecache (lab default) | wordpress
+-q, --quiet         # only print the command output
+```
+
 ### Three verification stages
 
 | Stage | What it proves | Interruption |
@@ -105,6 +122,35 @@ Linux ... x86_64
 | `python poc/stage1_splice.py` | The splice grammar: `R[:k] \|\| C[k:]` decodes into a live `FileCache` object | simulated (writes the mixed state directly) |
 | `python poc/stage2_oom.py` | The **real** interrupted `pwrite()` — memcg OOM kills the worker inside the syscall | real (local controller sets `oom_score_adj`) |
 | `./phpaftershell-poc --target …` | Full chain over **plain HTTP only**: pressure → interrupted write → object injection → webshell → command — tuned from natural signals alone, the target reports nothing | real (remote memory pressure) |
+
+## Target support
+
+**Works** = the full chain over plain HTTP against that exact target with
+no target-side help, proven by CI on every push or by the evidence
+noted. All rows are **Linux** targets: the interruption needs a cgroup
+boundary (the bug itself is cross-platform — see
+[requirements](#requirements--reliability-notes)).
+
+| Target | Stack | Status | Evidence |
+|---|---|---|---|
+| Bare PHP demo app (lab victim, `:8087`) | Apache · mod_php · PHP 8.4.27 | ✅ **works** | CI every push — RCE within the attempt budget (observed: 2–22) |
+| nginx + php-fpm (lab fpm, `:8090`) | nginx · php-fpm · PHP 8.4.27 | ✅ **works** | CI every push — cross-SAPI, RCE observed as fast as attempt 1 |
+| Patched PHP (lab fixed, `:8088`) | Apache · PHP 8.4.28 | ✅ **not exploitable** | CI negative control — exhausts its budget with no hit |
+| `upload_progress` disabled (lab mitigated, `:8089`) | Apache · PHP 8.4.27 | ✅ **no entry path** | CI negative control — never writes a progress record |
+| WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | 🟡 **parked** | gadget + every mechanism proven; OOM band not yet reliable — [`experiments/wordpress/`](experiments/wordpress/README.md) |
+| Laravel | — | ⬜ planned | next target |
+| Joomla / Drupal | — | ⬜ not evaluated | — |
+
+What each row additionally needs beyond the vulnerable PHP itself:
+`session.save_handler=files` (default), `session.upload_progress` on
+(default), a memory-bounded worker, and — for command execution — a
+**gadget from the target's own code**. The lab ships its own
+`FileCache`; `--chain wordpress` plants WordPress's own `WP_HTML_Token`
+(PHPGGC `WordPress/RCE2`). For CMS/framework rows the two hard parts are
+(1) a component that calls native `session_start()` (WordPress core
+never does — the parked target uses a realistic session-using plugin)
+and (2) a gadget chain that fits the splice — which is why those rows
+are parked/planned rather than green.
 
 ## How the splice works
 
@@ -137,9 +183,13 @@ and it only ever watches **natural signals** to know where it landed
 
 The exploit (all three stages) needs:
 
-- a **vulnerable PHP** (table above) with the default `session.save_handler=files`;
-- a **memory-bounded target** — the OOM interruption needs a cgroup
-  boundary; the bundled lab uses `mem_limit: 64m` (normal for containers);
+- a **vulnerable PHP** (see [target support](#target-support)) with the
+  default `session.save_handler=files`;
+- a **Linux target with a memory boundary** — the interruption is
+  produced by a memcg OOM, so a container/K8s limit or an equivalent
+  cgroup budget is required. The bundled lab uses `mem_limit: 64m`
+  (normal for containers). The vulnerability itself is cross-platform;
+  this chain's *kill mechanism* is Linux-specific;
 - a **destructor gadget** — the demo app ships a representative `FileCache`;
   real frameworks/apps (WordPress, Laravel, …) have known gadget chains;
 - **low latency** to the target (the bundled lab is localhost; timing is
@@ -156,22 +206,29 @@ diagnostic endpoint, no state dump and no helper route. Every attempt is
 judged from natural signals alone —
 
 - **the victim connection itself**: a timeout means the write completed
-  (limit never crossed → more pressure), a fast death means the OOM
-  struck before the write (→ less pressure), a slow death means it
-  struck deeper into the rewrite (→ more pressure); the fast/slow split
-  calibrates from the run's own death times, so it encodes no host's
-  timing;
+  (limit never crossed → more pressure); a death within **250ms** means
+  the OOM struck during serialisation, long before the pwrite finished
+  (→ less pressure); a death after 250ms outlived a full serialisation
+  plus part of the write (→ more pressure). The 250ms threshold comes
+  from the measured death distributions on every target so far (early
+  deaths land at 7–108ms — a 16 MiB serialisation cannot finish faster
+  — late deaths at ≥1.2s); an earlier adaptive split was tried and
+  discarded after it collapsed on clustered data and thrashed the
+  pressure for a whole CI run;
 - **PHP's `Failed to decode` warning** on the consumer response: the file
   is structurally broken → the attempt carries no trustworthy direction
   and the pressure is held;
-- **the webshell probe**: the shell name is randomised **per run**, so a
-  stale shell can never fake a hit — this is the only positive signal.
+- **the positive signal**: the webshell probe, against a shell name
+  randomised **per run** so a stale shell can never fake a hit — or, in
+  `--chain wordpress` mode, a per-run **marker echoed by the gadget**
+  (`system()` output appended to the consumer response) — that mode
+  writes no shell file at all.
 
 The pressure search bisects those signals into a bracket, slides a
 collapsed bracket toward the last signal instead of freezing, and then
 samples the band (the landing is stochastic at the edges). On the
 bundled lab it lands within a handful of attempts; `--attempts`
-(default 40) raises the budget.
+(default 40, CI uses 80) raises the budget.
 
 ## WordPress target (research status)
 
@@ -250,7 +307,8 @@ make clean     # wipe lab artifacts (sessions, results, stray shells)
 python -m pip install pytest
 python -m pytest tests/ -q     # offline: geometry, decoder, classifier
 
-python poc/charge_trace.py 8087  # prints this host's victim charge curve
+python poc/charge_trace.py 8087                    # victim's charge curve
+python poc/charge_trace.py 8090 phpaftershell-fpm-1 # any target's curve
 ```
 
 CI (`.github/workflows/ci.yml`) runs the unit tests plus the full
@@ -259,6 +317,10 @@ remote exploit, the charge-trace diagnostic, the remote RCE itself, the
 **same chain again against nginx + php-fpm (cross-SAPI)**, and both
 controls (patched 8.4.28 must not be exploitable; the mitigated target
 must never write a progress record).
+
+Found something wrong with the lab, the exploit or the CI? See
+[SECURITY.md](SECURITY.md) for how to report it (and what is out of
+scope).
 
 ## References
 
