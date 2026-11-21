@@ -35,17 +35,22 @@ write** (k in `[f, E')`). WordPress defeats this with its own footprint:
 
 Configurations tried (each a full 40-attempt run unless noted):
 
-| mem_limit | pool | result |
+| mem_limit | fillers | result |
 |---|---|---|
-| 64m | 8 (pinned) | band razor-thin at h≈0.3–0.9M; 0 hits in 40 (closest: `late`) |
-| 96m | 8 | bio-store hits the ceiling; `nooom` pinned at h_max |
-| 128m | 3 | pressure charges correctly (+29M) but reclaim absorbs the crossing; `nooom` everywhere |
-| 64m | 3 | (measured, not run: resting ≈48M leaves no band) |
+| 64m | 4 | band razor-thin at h≈0.3–0.9M; 0 hits in 40 (closest: `late`) |
+| 96m | 4 | band unreachable (h_max 28M too low for the window); `nooom` |
+| 128m | 8 | pressure charges correctly (+54M measured) but reclaim absorbs the crossing; `nooom` everywhere |
+| 112m | 8 | window needs pre ≥105M, max pressure gives ~99M; `nooom` |
+| **96m** | **8** | **the model's window (pre ∈ 89–105, measured ~99) — flip zone located at h≈37M (nooom 36.99 / early 37.39 / late 37.84) but 0 hits across 100+13 in-zone samples: the write-crossing itself is stochastic on this host (reclaim/writeback race), P(hit) per in-band sample ≈ ≤10%** |
 
-**Lead for future work**: the model suggests `mem_limit ≈ 110–118m`
-(anon+serial ≈ 109 must exceed the limit *after* reclaim drains the
-code cache, while the bio transient ≈ 90 must stay below it) — a ~10M
-window that was not validated before the time-box expired.
+**Conclusion**: the landing exists but its per-sample probability is too
+low for a reliable CI step — parked after the time-box expired.
+Resuming options: (a) raise the in-band sample count (200+ attempts,
+~15min), (b) attack the reclaim/writeback race directly (an eviction
+lever during the write — note the no-oracle constraint: any helper
+endpoint must be removed again for the final version), or (c) accept
+the row as "gadget-proven, band-unreliable" and prefer targets whose
+footprint matches the green bare-app economics (Laravel is next).
 
 ## Files
 

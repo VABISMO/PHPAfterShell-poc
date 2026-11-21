@@ -240,12 +240,12 @@ output). No lab-provided gadget is involved.
 
 The full chain against a real WordPress is **built but parked**: every
 mechanical piece is proven (session entry via a realistic mu-plugin,
-carrier record, +29 MiB of filler pressure, the 16 MiB victim rewrite,
-the gadget), but the **OOM crossing does not converge yet** — WP's
-~20–30 MiB of *evictable* code page-cache absorbs the charge before the
-cgroup limit is reached, so the victim's write is never interrupted in
-the window. Measured configurations, the numbers, and the lead for
-resuming (a `mem_limit ≈ 110–118m` window) are documented in
+carrier record, +54 MiB of filler pressure, the 16 MiB victim rewrite,
+the gadget), and five `mem_limit` configurations were tried — at the
+best one (96m + 8 fillers) the flip zone was located precisely
+(h≈37M) but the write-crossing itself proved stochastic on this host
+(≤10% per in-band sample: 0 hits in 100+ attempts). Measured numbers
+and resume options are in
 [`experiments/wordpress/README.md`](experiments/wordpress/README.md).
 
 ## Controls (the lab proves the fix works)
