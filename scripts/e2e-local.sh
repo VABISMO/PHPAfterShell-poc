@@ -8,6 +8,10 @@ cd "$(dirname "$0")/.."
 echo "== unit tests"
 python3 -m pytest tests/ -q
 
+echo "== start lab"
+mkdir -p sessions
+docker compose -p phpaftershell up -d --wait
+
 echo "== stage 1: deterministic splice"
 python3 -u poc/stage1_splice.py
 
@@ -15,7 +19,7 @@ echo "== stage 2: real OOM-interrupted pwrite"
 python3 -u poc/stage2_oom.py
 
 echo "== fresh target for the remote exploit"
-rm -f sessions/sess_*
+rm -f sessions/sess_* sessions/php*
 docker compose -p phpaftershell up -d --force-recreate --wait victim
 curl -sf http://127.0.0.1:8087/ >/dev/null
 

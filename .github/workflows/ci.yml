@@ -28,8 +28,13 @@ jobs:
       - name: Start the lab (vulnerable / fixed / mitigated targets)
         # -p pins the project name so container names are deterministic
         # (phpaftershell-victim-1, ...) regardless of checkout directory.
-        # --wait blocks until every healthcheck passes.
-        run: docker compose -p phpaftershell up -d --wait
+        # --wait blocks until every healthcheck passes. mkdir first: if
+        # Docker creates sessions/ itself it is root-owned + sticky (the
+        # container chmods it 1777) and the runner cannot delete files
+        # from it later ("Operation not permitted").
+        run: |
+          mkdir -p sessions
+          docker compose -p phpaftershell up -d --wait
 
       - name: "Stage 1 - deterministic spliced-session object injection"
         run: python poc/stage1_splice.py
@@ -43,7 +48,7 @@ jobs:
         # pages only add writeback contention for the fresh cgroup) and
         # start from a clean target, exactly as a real engagement would.
         run: |
-          rm -f sessions/sess_*
+          rm -f sessions/sess_* sessions/php*
           docker compose -p phpaftershell up -d --force-recreate --wait victim
           curl -sf http://127.0.0.1:8087/
 
