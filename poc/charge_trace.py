@@ -52,6 +52,24 @@ def main() -> int:
             out, _ = proc.communicate()
     elapsed = time.monotonic() - t0
 
+    # What did the attempt actually leave on disk? (lab-side harness:
+    # docker exec is allowed here - this is the only place we can see
+    # the runner's file state, since the chain itself has no oracle.)
+    try:
+        data = lab.sess_read(res.get("sid", ""))
+        verdict, k = lab.classify_file(data, b"")
+        print(f"FILE: size={len(data)} verdict={verdict} k={k}")
+    except Exception as e:
+        print(f"FILE: unreadable ({type(e).__name__}: {e})")
+    try:
+        cur = int(subprocess.run(
+            ["docker", "exec", lab.CONTAINER, "cat",
+             "/sys/fs/cgroup/memory.current"],
+            capture_output=True, text=True, timeout=10).stdout.strip())
+        print(f"CGROUP-END: {cur // 1048576}M")
+    except Exception:
+        pass
+
     samples = [int(x) for x in out.split() if x.strip().isdigit()]
     limit = 64 * 1024 * 1024   # matches docker-compose mem_limit
     print(f"=== CHARGE TRACE: attempt={res}")
