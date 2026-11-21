@@ -119,6 +119,9 @@ services:
   fpm:
     build: ./fpm
     command: sh -c "chmod 777 /var/www/html && chmod 1777 /tmp && exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf"
+    # 64m (not 96m): the fpm target is lighter (nginx + fpm workers, no
+    # per-child WP/apache footprint) and its band is proven at 64m -
+    # locally (RCE attempt 4-6) and on CI (attempt 9).
     mem_limit: 64m
     restart: unless-stopped
     healthcheck:

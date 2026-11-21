@@ -53,7 +53,7 @@ def main() -> int:
     elapsed = time.monotonic() - t0
 
     samples = [int(x) for x in out.split() if x.strip().isdigit()]
-    limit = 64 * 1024 * 1024
+    limit = 64 * 1024 * 1024   # matches docker-compose mem_limit
     print(f"=== CHARGE TRACE: attempt={res}")
     print(f"elapsed={elapsed:.1f}s samples={len(samples)} "
           f"min={min(samples)/1048576:.1f}M max={max(samples)/1048576:.1f}M "

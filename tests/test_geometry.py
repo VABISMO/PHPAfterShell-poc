@@ -255,22 +255,17 @@ def test_classify_file():
 def test_derive_signals():
     """Natural signals map to pressure directions (no target report)."""
     # a decode warning is untrustworthy: hold
-    assert remote._derive({"decode_failed": True, "victim": "eof"},
-                          [])[0] == "noise"
+    assert remote._derive({"decode_failed": True, "victim": "eof"})[0] == "noise"
     # the write completed: the limit was never crossed -> more pressure
-    assert remote._derive({"victim": "timeout", "drop_ms": 6006.0},
-                          [])[0] == "nooom"
-    # death times calibrate the early/late split from this run itself
-    times = [120.0, 900.0]           # split = 120 + (900-120)/3 = 380
-    fast = {"victim": "eof", "drop_ms": 200.0}
-    slow = {"victim": "rst", "drop_ms": 750.0}
-    assert remote._derive(fast, times)[0] == "early"   # died before the write
-    assert remote._derive(slow, times)[0] == "late"    # died deeper in it
-    # no calibration yet: bootstrap threshold
-    assert remote._derive({"victim": "eof", "drop_ms": 50.0},
-                          [])[0] == "early"
-    assert remote._derive({"victim": "eof", "drop_ms": 900.0},
-                          [])[0] == "late"
+    assert remote._derive({"victim": "timeout", "drop_ms": 6006.0})[0] == "nooom"
+    # fixed 250ms threshold (measured: early deaths 7-108ms - a 16MiB
+    # serialisation cannot finish faster; late deaths >= 1.2s)
+    assert remote._derive({"victim": "eof", "drop_ms": 50.0})[0] == "early"
+    assert remote._derive({"victim": "eof", "drop_ms": 250.0})[0] == "early"
+    assert remote._derive({"victim": "eof", "drop_ms": 251.0})[0] == "late"
+    assert remote._derive({"victim": "rst", "drop_ms": 1500.0})[0] == "late"
+    # unknown victim events are noise (hold)
+    assert remote._derive({"victim": "weird"})[0] == "noise"
 
 
 def test_remote_payload_big_geometry():

