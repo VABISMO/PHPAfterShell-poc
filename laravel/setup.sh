@@ -28,4 +28,20 @@ touch /var/www/html/.lab-installed
 chmod 1777 /tmp
 echo "[lab] ready"
 
-wait "$APACHE_PID"
+# Hold the container on Apache - and bring it straight back if the
+# master goes away. A bounded-memory target gets OOM-killed by design;
+# without this loop the death of apache2-foreground would end the
+# script, take the whole container down and force a full re-bootstrap
+# after every attempt. The other lab targets run the same watchdog.
+while true; do
+    if ! kill -0 "$APACHE_PID" 2>/dev/null; then
+        echo "[lab] apache master gone - restarting"
+        pkill -9 apache2 2>/dev/null || true
+        rm -f /var/run/apache2/apache2.pid
+        sleep 0.3
+        docker-php-entrypoint apache2-foreground &
+        APACHE_PID=$!
+        sleep 1
+    fi
+    sleep 1
+done

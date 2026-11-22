@@ -94,10 +94,11 @@ def main() -> int:
                    help="shell command to execute on the target")
     p.add_argument("--attempts", type=int, default=40, metavar="N",
                    help="maximum interruption attempts (default: 40)")
-    p.add_argument("--chain", choices=("filecache", "wordpress"),
+    p.add_argument("--chain", choices=("filecache", "wordpress", "laravel"),
                    default="filecache",
-                   help="planted gadget: the lab's FileCache (default) "
-                        "or the real WordPress core chain (WP_HTML_Token)")
+                   help="planted gadget: the lab's FileCache (default), "
+                        "WordPress core (WP_HTML_Token) or Laravel's own "
+                        "vendor tree (PHPGGC Laravel/RCE9)")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="only print the command output")
     p.add_argument("--version", action="version",

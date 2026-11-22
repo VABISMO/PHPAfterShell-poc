@@ -38,7 +38,33 @@ RUN rm -rf /var/www/html/* \
 # and stores one user-submitted field; it reports nothing and provides
 # no endpoint or diagnostic. See routes/web.php.
 COPY routes-web.php /var/www/html/routes/web.php
-RUN chown www-data:www-data /var/www/html/routes/web.php
+COPY app/Http/Middleware/NativeSession.php /var/www/html/app/Http/Middleware/NativeSession.php
+
+# Serve Laravel the way Laravel is always served: DocumentRoot =
+# public/. The framework's own docs are explicit that everything else
+# (artisan, .env, composer files) must never be web-reachable.
+# AllowOverride All so public/.htaccess (Laravel's own front-controller
+# rewrite + dotfile protections) is honoured - stock Laravel's Apache
+# docs require it; with AllowOverride None every non-file route 404s
+# at Apache before Laravel sees it.
+RUN sed -i 's|DocumentRoot /var/www/html$|DocumentRoot /var/www/html/public|' \
+        /etc/apache2/sites-available/000-default.conf \
+    && chown -R www-data:www-data /var/www/html/routes /var/www/html/app
+
+# AllowOverride for the docroot only (see the file's header): Laravel's
+# .htaccess must run or every non-file route 404s at Apache.
+COPY apache-allowoverride.conf /etc/apache2/conf-available/zz-lab-allowoverride.conf
+# mod_rewrite is not loaded in the stock image, and Laravel's
+# public/.htaccess guards its rules in <IfModule mod_rewrite.c> - so
+# without it every non-file route silently 404s at Apache.
+RUN a2enconf zz-lab-allowoverride && a2enmod rewrite
+
+# Bounded-container Apache tuning (see the file's header): without it
+# the prefork children accumulate allocator arenas and the cgroup
+# baseline drifts past the landable band within a few attempts.
+COPY apache-mcc.conf /etc/apache2/conf-available/zz-lab-mcc.conf
+RUN a2enconf zz-lab-mcc
+
 
 # Boot: apache in the background (the image entrypoint still does its
 # init for an apache2-foreground argument), mark readiness, hold.

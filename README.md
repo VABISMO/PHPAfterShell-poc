@@ -80,6 +80,7 @@ access to the target.
 ├── scripts/e2e-local.sh     # local mirror of the CI sequence (make e2e)
 ├── tests/test_geometry.py   # offline unit tests (no docker needed)
 ├── experiments/wordpress/   # working WordPress target (opt-in --profile wp)
+├── experiments/laravel/     # working Laravel target (opt-in --profile laravel)
 └── .github/workflows/ci.yml # unit + end-to-end RCE + controls
 ```
 
@@ -111,7 +112,7 @@ CLI options:
 --target URL        # base URL of the target (required)
 --command CMD       # shell command to execute (required)
 --attempts N        # interruption budget (default 40; CI uses 80)
---chain NAME        # planted gadget: filecache (lab default) | wordpress
+--chain NAME        # planted gadget: filecache (lab default) | wordpress | laravel
 -q, --quiet         # only print the command output
 ```
 
@@ -138,24 +139,26 @@ boundary (the bug itself is cross-platform — see
 | Patched PHP (lab fixed, `:8088`) | Apache · PHP 8.4.28 | ✅ **not exploitable** | CI negative control — exhausts its budget with no hit |
 | `upload_progress` disabled (lab mitigated, `:8089`) | Apache · PHP 8.4.27 | ✅ **no entry path** | CI negative control — never writes a progress record |
 | WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | ✅ **works** | `docker compose --profile wp up -d --wait` + `--chain wordpress` — RCE on attempt 63 of an 80-attempt run (lab harness at calibrated pressure: 8/12); gadget is WordPress core's own `WP_HTML_Token` — [`experiments/wordpress/`](experiments/wordpress/README.md) |
-| Laravel 11 | Apache · mod_php · PHP 8.4.27 | 🔧 **WIP** | `--profile laravel`; image builds and boots, entry/cookie/gadget steps still unverified |
+| Laravel 11.57 | Apache · mod_php · PHP 8.4.27 | ✅ **works** | `docker compose --profile laravel up -d --wait` + `--chain laravel` — RCE on attempt 14, 23 and 45 of three 60–80-attempt runs; gadget is the framework's own `Illuminate\Broadcasting\PendingBroadcast` (PHPGGC `Laravel/RCE9`, byte-identical payload) — [`experiments/laravel/`](experiments/laravel/README.md) |
 | Joomla / Drupal | — | ⬜ not evaluated | — |
 
 Targets behind a `--profile` are **never started by CI or a plain
 `docker compose up`** — the default lab (and CI) starts only the four
-targets that are not behind a profile; WordPress is opt-in.
+targets that are not behind a profile; WordPress and Laravel are
+opt-in.
 
 What each row additionally needs beyond the vulnerable PHP itself:
 `session.save_handler=files` (default), `session.upload_progress` on
 (default), a memory-bounded worker, and — for command execution — a
 **gadget from the target's own code**. The lab ships its own
 `FileCache`; `--chain wordpress` plants WordPress's own `WP_HTML_Token`
-(PHPGGC `WordPress/RCE2`). For CMS/framework rows the two hard parts are
-(1) a component that calls native `session_start()` (WordPress core
-never does — the shipped WP target uses a realistic session-using
-plugin) and (2) a gadget chain that fits the splice. WordPress solves
-both and is green behind its profile; Laravel/Joomla/Drupal remain
-parked/planned.
+(PHPGGC `WordPress/RCE2`), `--chain laravel` plants Laravel's own
+`Illuminate\Broadcasting\PendingBroadcast` (PHPGGC `Laravel/RCE9`). For
+CMS/framework rows the two hard parts are (1) a component that calls
+native `session_start()` (WordPress core never does — the shipped WP
+target uses a realistic session-using plugin) and (2) a gadget chain
+that fits the splice. WordPress and Laravel solve both and are green
+behind their profiles; Joomla/Drupal remain parked/planned.
 
 ## How the splice works
 

