@@ -79,7 +79,7 @@ access to the target.
 │   └── charge_trace.py      # diagnostic: this host's victim charge curve
 ├── scripts/e2e-local.sh     # local mirror of the CI sequence (make e2e)
 ├── tests/test_geometry.py   # offline unit tests (no docker needed)
-├── experiments/wordpress/   # parked WordPress target + research notes
+├── experiments/wordpress/   # working WordPress target (opt-in --profile wp)
 └── .github/workflows/ci.yml # unit + end-to-end RCE + controls
 ```
 
@@ -137,13 +137,13 @@ boundary (the bug itself is cross-platform — see
 | nginx + php-fpm (lab fpm, `:8090`) | nginx · php-fpm · PHP 8.4.27 | ✅ **works** | CI every push — cross-SAPI, RCE observed as fast as attempt 1 |
 | Patched PHP (lab fixed, `:8088`) | Apache · PHP 8.4.28 | ✅ **not exploitable** | CI negative control — exhausts its budget with no hit |
 | `upload_progress` disabled (lab mitigated, `:8089`) | Apache · PHP 8.4.27 | ✅ **no entry path** | CI negative control — never writes a progress record |
-| WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | 🟡 **runnable, band unreliable** | `docker compose --profile wp up -d --wait`; gadget + every mechanism proven, 0 hits in 113+ attempts across 5 configs — [`experiments/wordpress/`](experiments/wordpress/README.md) |
+| WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | ✅ **works** | `docker compose --profile wp up -d --wait` + `--chain wordpress` — RCE on attempt 63 of an 80-attempt run (lab harness at calibrated pressure: 8/12); gadget is WordPress core's own `WP_HTML_Token` — [`experiments/wordpress/`](experiments/wordpress/README.md) |
 | Laravel 11 | Apache · mod_php · PHP 8.4.27 | 🔧 **WIP** | `--profile laravel`; image builds and boots, entry/cookie/gadget steps still unverified |
 | Joomla / Drupal | — | ⬜ not evaluated | — |
 
 Targets behind a `--profile` are **never started by CI or a plain
-`docker compose up`** — the default lab (and CI) stays exactly the four
-green rows above.
+`docker compose up`** — the default lab (and CI) starts only the four
+targets that are not behind a profile; WordPress is opt-in.
 
 What each row additionally needs beyond the vulnerable PHP itself:
 `session.save_handler=files` (default), `session.upload_progress` on
@@ -152,9 +152,10 @@ What each row additionally needs beyond the vulnerable PHP itself:
 `FileCache`; `--chain wordpress` plants WordPress's own `WP_HTML_Token`
 (PHPGGC `WordPress/RCE2`). For CMS/framework rows the two hard parts are
 (1) a component that calls native `session_start()` (WordPress core
-never does — the parked target uses a realistic session-using plugin)
-and (2) a gadget chain that fits the splice — which is why those rows
-are parked/planned rather than green.
+never does — the shipped WP target uses a realistic session-using
+plugin) and (2) a gadget chain that fits the splice. WordPress solves
+both and is green behind its profile; Laravel/Joomla/Drupal remain
+parked/planned.
 
 ## How the splice works
 
@@ -234,7 +235,7 @@ samples the band (the landing is stochastic at the edges). On the
 bundled lab it lands within a handful of attempts; `--attempts`
 (default 40, CI uses 80) raises the budget.
 
-## WordPress target (research status)
+## WordPress target (opt-in, working)
 
 The exploit ships `--chain wordpress`, which plants **WordPress's own
 core gadget** instead of the lab's FileCache: PHPGGC `WordPress/RCE2` —
@@ -242,16 +243,26 @@ core gadget** instead of the lab's FileCache: PHPGGC `WordPress/RCE2` —
 the exact planted bytes through PHP: `unserialize` → `unset` → command
 output). No lab-provided gadget is involved.
 
-The full chain against a real WordPress is **built and runnable behind
-`docker compose --profile wp`**, but not part of CI: every mechanical
-piece is proven (session entry via a realistic mu-plugin, carrier
-record, +54 MiB of filler pressure, the 16 MiB victim rewrite, the
-gadget), and five `mem_limit` configurations were tried — at the
-best one (96m + 8 fillers) the flip zone was located precisely
-(h≈37M) but the write-crossing itself proved stochastic on this host
-(≤10% per in-band sample: 0 hits in 100+ attempts). Measured numbers
-and resume options are in
+The full chain runs against a real WordPress behind
+`docker compose --profile wp up -d --wait`:
+
+```sh
+./phpaftershell-poc --target http://127.0.0.1:8091 --command 'id' \
+    --attempts 80 --chain wordpress
+```
+
+Observed `RCE on attempt 63` of an 80-attempt run (and 8/12 in the
+lab-side harness at the calibrated pressure) — the landing is stochastic
+(the OOM must interrupt the pwrite inside the splice window), so a run
+is a per-run lottery: budget 80+ attempts (each takes ~5 s) and rerun
+on a miss. Getting there needed three measured fixes
+(swap headroom absorbing the OOM, `wp_magic_quotes()` corrupting a
+`$_POST` payload, and PHP's 5120-byte multipart header splitting), plus
+a two-carrier layout so the session file grows during the write; all of
+it is documented with the numbers in
 [`experiments/wordpress/README.md`](experiments/wordpress/README.md).
+It stays behind a profile (and out of CI) so the default lab remains
+the four targets above.
 
 ## Controls (the lab proves the fix works)
 

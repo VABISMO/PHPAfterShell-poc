@@ -179,7 +179,19 @@ services:
       WORDPRESS_DB_PASSWORD: wordpress
       WORDPRESS_DB_NAME: wordpress
       WP_URL: http://127.0.0.1:8091
-    mem_limit: 96m
+    # Bounded memory with NO swap headroom (memswap == mem): without a
+    # mem limit the victim never OOMs mid-pwrite; with swap available
+    # memcg just swaps the charge out instead of killing the writer
+    # (measured: memory.swap.current grew while the write completed).
+    # 172m is where the 8-filler pressure band plus the victim's
+    # serialise crosses exactly as its pwrite starts: the OOM then
+    # interrupts the write inside the splice window (measured landable
+    # h in ~[42M, 52M]; 180m was tried and pushed the band past the
+    # fillers' range without sparing the consumer). Containers without
+    # swap headroom (memory.swap.max=0) are also the default under
+    # Kubernetes, where memory + memory-swap are set equal.
+    mem_limit: 172m
+    memswap_limit: 172m
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "test -f /var/www/html/.lab-installed && php -r 'exit(@fsockopen(\"127.0.0.1\", 80)?0:1);'"]
@@ -190,9 +202,14 @@ services:
     ports:
       - "127.0.0.1:8091:80"
     volumes:
+      # Only the volume + opcache disabled: opcache is not loaded by
+      # stock php.net installs (the Docker image turns it on), so this
+      # RESTORES the default rather than tuning anything. With opcache
+      # on, WP's cold source page-cache pool races the write charge and
+      # the landing never comes (measured).
       - wp-data:/var/www/html
-      - ./experiments/wordpress/wp-apache-tuning.conf:/etc/apache2/conf-enabled/zz-lab.conf:ro
-      - ./experiments/wordpress/wp-sessions.ini:/usr/local/etc/php/conf.d/zz-lab-sessions.ini:ro
+      - ./experiments/wordpress/apache-mcc.conf:/etc/apache2/conf-enabled/zz-lab-mcc.conf:ro
+      - ./experiments/wordpress/opcache-off.ini:/usr/local/etc/php/conf.d/zz-opcache-off.ini:ro
 
   wp-db:
     profiles: ["wp"]

