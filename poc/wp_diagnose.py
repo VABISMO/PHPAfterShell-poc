@@ -15,8 +15,8 @@ never touches any of it.
 
 usage: wp_diagnose.py [port] [container] [h] [chain]
 
-chain is "wordpress" (default), "laravel" or "drupal"; the
-harness then reproduces that chain's exact attempt flow.
+chain is "wordpress" (default), "laravel", "drupal" or "joomla";
+the harness then reproduces that chain's exact attempt flow.
 """
 from __future__ import annotations
 

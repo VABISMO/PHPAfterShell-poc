@@ -196,6 +196,64 @@ services:
     ports:
       - "127.0.0.1:8093:80"
 
+  # Joomla 5.2.1 target - OPT-IN via profile (never started by CI or
+  # a plain 'docker compose up'):
+  #   docker compose --profile joomla up -d --wait
+  # Stock Joomla 5.2.1 on the official image's pinned PHP 8.2.27
+  # (inside the advisory's range), installed at first boot by the
+  # image's own env-driven CLI auto-installer. The chain plants
+  # PHPGGC's Joomla/FW1 (FormattedtextLogger file write) - see
+  # experiments/joomla/README.md.
+  joomla:
+    profiles: ["joomla"]
+    build: ./joomla
+    command: ["/usr/local/bin/lab-setup.sh"]
+    depends_on:
+      joomla-db:
+        condition: service_healthy
+    environment:
+      JOOMLA_DB_HOST: joomla-db
+      JOOMLA_DB_USER: joomla
+      JOOMLA_DB_PASSWORD: joomla
+      JOOMLA_DB_NAME: joomla
+      JOOMLA_SITE_NAME: phpAfterShell lab
+      JOOMLA_ADMIN_USER: Admin
+      JOOMLA_ADMIN_USERNAME: admin
+      JOOMLA_ADMIN_PASSWORD: LabPass123456!
+      JOOMLA_ADMIN_EMAIL: lab@example.com
+      # The lab's session component travels the image's official
+      # extension mechanism (extension:install after the stock install)
+      JOOMLA_EXTENSIONS_PATHS: /opt/lab-labsession.zip
+    # No swap headroom (memswap == mem): swap absorbs the OOM (the
+    # same root cause measured on every other target). The limit is
+    # calibrated against the cgroup trace like every other target.
+    mem_limit: 128m
+    memswap_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/www/html/.lab-installed && php -r 'exit(@fsockopen(\"127.0.0.1\", 80)?0:1);'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    ports:
+      - "127.0.0.1:8094:80"
+
+  joomla-db:
+    profiles: ["joomla"]
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: joomla
+      MARIADB_USER: joomla
+      MARIADB_PASSWORD: joomla
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
   # WordPress target - OPT-IN via profile (never started by CI or a
   # plain 'docker compose up'):
   #   docker compose --profile wp up -d --wait

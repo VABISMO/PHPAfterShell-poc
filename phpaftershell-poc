@@ -95,12 +95,14 @@ def main() -> int:
     p.add_argument("--attempts", type=int, default=40, metavar="N",
                    help="maximum interruption attempts (default: 40)")
     p.add_argument("--chain",
-                   choices=("filecache", "wordpress", "laravel", "drupal"),
+                   choices=("filecache", "wordpress", "laravel", "drupal",
+                            "joomla"),
                    default="filecache",
                    help="planted gadget: the lab's FileCache (default), "
                         "WordPress core (WP_HTML_Token), Laravel's vendor "
-                        "tree (PHPGGC Laravel/RCE9) or Drupal core "
-                        "(PHPGGC Drupal7/RCE1)")
+                        "tree (PHPGGC Laravel/RCE9), Drupal core "
+                        "(PHPGGC Drupal7/RCE1) or Joomla core "
+                        "(PHPGGC Joomla/FW1)")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="only print the command output")
     p.add_argument("--version", action="version",

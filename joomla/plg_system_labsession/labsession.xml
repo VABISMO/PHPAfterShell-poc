@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<extension type="plugin" group="system" method="upgrade">
+    <name>lab_session</name>
+    <version>1.0.0</version>
+    <description>Lab component: stores one user-submitted field in the native PHP session - the ordinary form -&gt; session behaviour a real session-using plugin provides. It reports nothing, provides no endpoint and no diagnostic: the exploit still learns only from natural HTTP behaviour.</description>
+    <files>
+        <filename plugin="labsession">labsession.php</filename>
+    </files>
+</extension>
