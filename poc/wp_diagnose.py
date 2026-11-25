@@ -134,16 +134,19 @@ def main() -> int:
     # Read the file FROM INSIDE THE CONTAINER: the wp service does not
     # mount ./sessions (only the bare/fpm targets do), so lab.sess_read's
     # host path does not exist here and would always report size=0.
+    # Newest session file: chains with a fresh sid per attempt do not
+    # use the sid below.
     r = subprocess.run(
         ["docker", "exec", lab.CONTAINER, "sh", "-c",
-         f"if [ -f /tmp/sess_{sid} ]; then wc -c < /tmp/sess_{sid}; "
-         f"else echo MISSING; fi"],
+         'f=$(ls -t /tmp/sess_* 2>/dev/null | head -1); '
+         'if [ -n "$f" ]; then wc -c < "$f"; else echo MISSING; fi'],
         capture_output=True, text=True, timeout=30)
     out_size = r.stdout.strip()
     print(f"FILE(container): size={out_size}")
     if out_size.isdigit():
         rr = subprocess.run(
-            ["docker", "exec", lab.CONTAINER, "cat", f"/tmp/sess_{sid}"],
+            ["docker", "exec", lab.CONTAINER, "sh", "-c",
+             'cat "$(ls -t /tmp/sess_* | head -1)"'],
             capture_output=True, timeout=60)
         verdict, k = lab.classify_file(rr.stdout, b"")
         print(f"FILE(container): bytes={len(rr.stdout)} "

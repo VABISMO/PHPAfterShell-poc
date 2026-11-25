@@ -82,10 +82,12 @@ access to the target.
 ├── laravel/                 # working Laravel target (opt-in --profile laravel)
 ├── drupal/                  # working Drupal 7 target (opt-in --profile drupal)
 ├── joomla/                  # working Joomla 5 target (opt-in --profile joomla)
+├── thinkphp/                # working ThinkPHP target (opt-in --profile thinkphp)
 ├── experiments/wordpress/   # WordPress target notes (opt-in --profile wp)
 ├── experiments/laravel/     # Laravel target notes
 ├── experiments/drupal/      # Drupal target notes
 ├── experiments/joomla/      # Joomla target notes
+├── experiments/thinkphp/    # ThinkPHP target notes
 └── .github/workflows/ci.yml # unit + end-to-end RCE + controls
 ```
 
@@ -117,7 +119,7 @@ CLI options:
 --target URL        # base URL of the target (required)
 --command CMD       # shell command to execute (required)
 --attempts N        # interruption budget (default 40; CI uses 80)
---chain NAME        # planted gadget: filecache (lab default) | wordpress | laravel | drupal | joomla
+--chain NAME        # planted gadget: filecache (lab default) | wordpress | laravel | drupal | joomla | thinkphp
 -q, --quiet         # only print the command output
 ```
 
@@ -146,12 +148,13 @@ boundary (the bug itself is cross-platform — see
 | WordPress 6.4.1 | Apache · mod_php · PHP 8.2.13 | ✅ **works** | `docker compose --profile wp up -d --wait` + `--chain wordpress` — RCE on attempt 63 of an 80-attempt run (lab harness at calibrated pressure: 8/12); gadget is WordPress core's own `WP_HTML_Token` — [`experiments/wordpress/`](experiments/wordpress/README.md) |
 | Laravel 11.57 | Apache · mod_php · PHP 8.4.27 | ✅ **works** | `docker compose --profile laravel up -d --wait` + `--chain laravel` — RCE on attempt 14, 23 and 45 of three 60–80-attempt runs; gadget is the framework's own `Illuminate\Broadcasting\PendingBroadcast` (PHPGGC `Laravel/RCE9`, byte-identical payload) — [`experiments/laravel/`](experiments/laravel/README.md) |
 | Drupal 7.98 | Apache · mod_php · PHP 8.2.33 | ✅ **works** | `docker compose --profile drupal up -d --force-recreate --wait` + `--chain drupal` — RCE on attempt 1–3 of the first run on a freshly started target (measured 8/8 first-runs); gadget is Drupal core's own `SchemaCache` (PHPGGC `Drupal7/RCE1`, two-step trigger) — [`experiments/drupal/`](experiments/drupal/README.md) |
+| ThinkPHP 6.1.5 | Apache · mod_php · PHP 8.2.33 | ✅ **works** | `docker compose --profile thinkphp up -d --wait` + `--chain thinkphp` — RCE on attempt 43 and 52 of 100-attempt runs (most stochastic target: budget 100); gadget is ThinkPHP's own vendor tree (`league/flysystem` Psr6Cache, PHPGGC `ThinkPHP/RCE3`) — [`experiments/thinkphp/`](experiments/thinkphp/README.md) |
 | Joomla 5.2.1 | Apache · mod_php · PHP 8.2.27 | ✅ **works** | `docker compose --profile joomla up -d --wait` + `--chain joomla` — RCE within the first 5 attempts of every run measured (6/6 runs: attempts 1, 2, 5, 1, 5, fresh and warm targets alike); gadget is Joomla core's own `FormattedtextLogger` (PHPGGC `Joomla/FW1`, file write → probe) — [`experiments/joomla/`](experiments/joomla/README.md) |
 
 Targets behind a `--profile` are **never started by CI or a plain
 `docker compose up`** — the default lab (and CI) starts only the four
-targets that are not behind a profile; WordPress, Laravel, Drupal and
-Joomla are opt-in.
+targets that are not behind a profile; WordPress, Laravel, Drupal,
+Joomla and ThinkPHP are opt-in.
 
 What each row additionally needs beyond the vulnerable PHP itself:
 `session.save_handler=files` (default), `session.upload_progress` on
@@ -164,11 +167,13 @@ What each row additionally needs beyond the vulnerable PHP itself:
 `Drupal7/RCE1`, fired through the chain's documented `/?q=system/ajax`
 trigger) and `--chain joomla` plants Joomla core's own
 `FormattedtextLogger` (PHPGGC `Joomla/FW1`, a file write whose random
-shell is then probed — the FileCache flow). For CMS/framework rows the
-two hard parts are (1) a component that calls native `session_start()`
+shell is then probed — the FileCache flow) and `--chain thinkphp`
+plants ThinkPHP's own vendor tree (`league/flysystem` Psr6Cache,
+PHPGGC `ThinkPHP/RCE3`). For CMS/framework rows the two hard parts
+are (1) a component that calls native `session_start()`
 (WordPress core never does — the shipped WP target uses a realistic
 session-using plugin) and (2) a gadget chain that fits the splice. All
-four framework targets solve both and are green behind their
+five framework targets solve both and are green behind their
 profiles.
 
 ## How the splice works

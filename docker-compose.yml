@@ -254,6 +254,37 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # ThinkPHP 6.1.5 target - OPT-IN via profile (never started by CI
+  # or a plain 'docker compose up'):
+  #   docker compose --profile thinkphp up -d --wait
+  # Stock ThinkPHP 6.1.5 on php:8.2.33-apache (inside the advisory's
+  # range); the app is created at build time. The chain plants
+  # PHPGGC's ThinkPHP/RCE3 (Psr6Cache from league/flysystem) - see
+  # experiments/thinkphp/README.md.
+  thinkphp:
+    profiles: ["thinkphp"]
+    build: ./thinkphp
+    command: ["/usr/local/bin/lab-setup.sh"]
+    # No swap headroom (memswap == mem): swap absorbs the OOM (the
+    # same root cause measured on every other target). ThinkPHP rests
+    # at ~24 MiB (measured) and the app is light: the landing is the
+    # most stochastic of the targets - the OOM must find the victim's
+    # write with an 8 MiB file-cache remainder (measured k = 130 bytes
+    # at 61m), so crossings that land mid-write are rare. At 128m the
+    # first two runs hit at attempts 52 and 43 of 100 - budget 100.
+    # See experiments/thinkphp/README.md.
+    mem_limit: 128m
+    memswap_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/www/html/.lab-installed && php -r 'exit(@fsockopen(\"127.0.0.1\", 80)?0:1);'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    ports:
+      - "127.0.0.1:8095:80"
+
   # WordPress target - OPT-IN via profile (never started by CI or a
   # plain 'docker compose up'):
   #   docker compose --profile wp up -d --wait
