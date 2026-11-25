@@ -96,12 +96,13 @@ def main() -> int:
                    help="maximum interruption attempts (default: 40)")
     p.add_argument("--chain",
                    choices=("filecache", "wordpress", "laravel", "drupal",
-                            "joomla", "thinkphp"),
+                            "drupal10", "joomla", "thinkphp"),
                    default="filecache",
                    help="planted gadget: the lab's FileCache (default), "
                         "WordPress core (WP_HTML_Token), Laravel's vendor "
                         "tree (PHPGGC Laravel/RCE9), Drupal core "
-                        "(PHPGGC Drupal7/RCE1), Joomla core "
+                        "(PHPGGC Drupal7/RCE1), Drupal 10's vendor tree "
+                        "(PHPGGC Guzzle/FW1), Joomla core "
                         "(PHPGGC Joomla/FW1) or ThinkPHP's vendor tree "
                         "(PHPGGC ThinkPHP/RCE3)")
     p.add_argument("-q", "--quiet", action="store_true",

